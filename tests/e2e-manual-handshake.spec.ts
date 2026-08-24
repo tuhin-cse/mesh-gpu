@@ -31,7 +31,12 @@ interface PeerLinkLike {
   open: boolean;
   connect(): Promise<void>;
   handleSignal(signal: unknown): Promise<void>;
-  sendTensor(frame: unknown): boolean;
+  sendTensor(
+    shape: number[],
+    values: Float32Array,
+    meta: { seqId: number; tokenIndex: number; fromLayer: number; toLayer: number },
+    options?: { dtype?: number },
+  ): Promise<boolean>;
   close(): void;
 }
 
@@ -69,12 +74,8 @@ interface PipelineApi {
     signaling: unknown;
     createPeerConnection: unknown;
   };
-  makeForwardFrame(
-    shape: number[],
-    data: Float32Array,
-    meta: { seqId: number; tokenIndex: number; fromLayer: number; toLayer: number },
-  ): unknown;
   frameAsFloat32(frame: TensorFrameLike): Float32Array;
+  TensorDType: { F32: number; F16: number };
 }
 
 /**
@@ -203,12 +204,14 @@ test('mock transport streams exact Float32Array tensor between two peers', async
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
 
-    const frame = w.p2pPipeline.makeForwardFrame(
+    // The wire defaults to f16, which is right for activations but lossy.
+    // Request f32 here so the assertion can be exact equality.
+    const sent = await linkA.sendTensor(
       [values.length],
       new Float32Array(values),
       { seqId: 1, tokenIndex: 0, fromLayer: 0, toLayer: 28 },
+      { dtype: w.p2pPipeline.TensorDType.F32 },
     );
-    const sent = linkA.sendTensor(frame);
 
     while (receivedValues.length === 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));

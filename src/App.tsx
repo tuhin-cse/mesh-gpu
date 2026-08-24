@@ -471,8 +471,8 @@ function PipelineCard({
             setLoopbackFps(stamps.length / 5);
             pushLog(`loopback frame returned (seq ${meta.seqId}) from ${meta.fromPeerId}`);
           },
-          onForwarded: (frame) => {
-            pushLog(`forwarded tensor → layers [${frame.fromLayer}, ${frame.toLayer})`);
+          onForwarded: (info) => {
+            pushLog(`forwarded tensor → layers [${info.fromLayer}, ${info.toLayer})`);
           },
           onError: (id, error) => {
             pushLog(`error (${id}): ${error.message}`);
@@ -566,7 +566,7 @@ function PipelineCard({
     const input = new Float32Array(16).map((_, i) => i);
     try {
       const token = await node.run(input, [1, 16]);
-      if (token !== null) pushLog(`loopback completed locally (argmax index ${token})`);
+      pushLog(`loopback completed (argmax index ${token})`);
     } catch (err) {
       pushLog(`run failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -850,7 +850,7 @@ function MockMeshDemo() {
     const input = new Float32Array(16).map((_, i) => i);
     try {
       const token = await first.node.run(input, [1, 16]);
-      if (token !== null) pushLog(`first-stage token: ${token}`);
+      pushLog(`mock mesh returned token ${token}`);
     } catch (err) {
       pushLog(`run failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -14,6 +14,16 @@
  */
 
 import type { SignalingClientLike, SignalPayload } from './signaling';
+import {
+  DEFAULT_MAX_CHUNK_BYTES,
+  FrameReassembler,
+  TensorDType,
+  TensorFrameKind,
+  decodeFrame,
+  encodeTensor,
+  frameAsFloat32,
+} from './tensor-wire';
+import type { FrameMeta, TensorFrame } from './tensor-wire';
 import { sanitizeTensor } from './webgpu-node';
 import { isMockP2PEnabled, MockSignaling } from './mock-transport';
 import type { DataChannelLike, PeerConnectionFactory, PeerConnectionLike } from './mock-transport';
@@ -93,156 +103,33 @@ export function createSignalingAndTransport(options: {
 // ---------------------------------------------------------------------------
 // Tensor wire format
 //
-//   bytes 0..3    uint32  magic  ("MGPU" = 0x4d475055)
-//   byte  4       uint8   version (1)
-//   byte  5       uint8   frame kind
-//   byte  6       uint8   dtype
-//   byte  7       uint8   rank (0..255)
-//   bytes 8..11   uint32  seqId
-//   bytes 12..15  uint32  tokenIndex
-//   bytes 16..19  uint32  fromLayer (start of the destination stage)
-//   bytes 20..23  uint32  toLayer   (end of the destination stage)
-//   bytes 24..27  uint32  payload byte length
-//   bytes 28..31  uint32  reserved (0)
-//   bytes 32..    uint32[rank] shape dims
-//   ...           payload (Float32Array hidden state, little-endian)
+// Lives in tensor-wire.ts: a 32-byte framed format with chunking (so
+// prefill-sized tensors survive a DataChannel) and f16 payloads (so they cost
+// half as much to move). Re-exported here because the pipeline is what most
+// callers import.
 // ---------------------------------------------------------------------------
 
-export const TENSOR_MAGIC = 0x4d475055;
-export const TENSOR_VERSION = 1;
-export const TENSOR_HEADER_BYTES = 32;
-
-export enum TensorDType {
-  F32 = 1,
-  F16 = 2,
-  I32 = 3,
-  U8 = 4,
-}
-
-export enum TensorFrameKind {
-  /** Hidden-state tensor flowing forward through the pipeline. */
-  Forward = 1,
-  /** Reserved for future binary token frames (tokens currently use control msgs). */
-  OutputToken = 2,
-}
+export {
+  DEFAULT_MAX_CHUNK_BYTES,
+  FrameReassembler,
+  TENSOR_HEADER_BYTES,
+  TENSOR_MAGIC,
+  TENSOR_VERSION,
+  TensorDType,
+  TensorFrameKind,
+  bytesPerElement,
+  decodeFrame,
+  elementCount,
+  encodeFrame,
+  encodeTensor,
+  frameAsFloat32,
+} from './tensor-wire';
+export type { FrameMeta, TensorFrame } from './tensor-wire';
 
 /** A contiguous, half-open layer range: [start, end). */
 export interface StageRange {
   start: number;
   end: number;
-}
-
-export interface TensorFrame {
-  kind: TensorFrameKind;
-  dtype: TensorDType;
-  shape: number[];
-  seqId: number;
-  tokenIndex: number;
-  fromLayer: number;
-  toLayer: number;
-  /** Raw payload bytes (hidden state for F32 frames). */
-  data: ArrayBuffer;
-}
-
-export const TensorCodec = {
-  encode(frame: TensorFrame): ArrayBuffer {
-    const rank = frame.shape.length;
-    const header = new ArrayBuffer(TENSOR_HEADER_BYTES + rank * 4);
-    const view = new DataView(header);
-
-    view.setUint32(0, TENSOR_MAGIC, true);
-    view.setUint8(4, TENSOR_VERSION);
-    view.setUint8(5, frame.kind);
-    view.setUint8(6, frame.dtype);
-    view.setUint8(7, rank);
-    view.setUint32(8, frame.seqId >>> 0, true);
-    view.setUint32(12, frame.tokenIndex >>> 0, true);
-    view.setUint32(16, frame.fromLayer >>> 0, true);
-    view.setUint32(20, frame.toLayer >>> 0, true);
-    view.setUint32(24, frame.data.byteLength >>> 0, true);
-    view.setUint32(28, 0, true);
-
-    for (let i = 0; i < rank; i += 1) {
-      view.setUint32(TENSOR_HEADER_BYTES + i * 4, frame.shape[i] >>> 0, true);
-    }
-
-    const out = new ArrayBuffer(header.byteLength + frame.data.byteLength);
-    new Uint8Array(out).set(new Uint8Array(header), 0);
-    new Uint8Array(out).set(new Uint8Array(frame.data), header.byteLength);
-    return out;
-  },
-
-  decode(buffer: ArrayBuffer): TensorFrame {
-    if (buffer.byteLength < TENSOR_HEADER_BYTES) {
-      throw new Error('tensor frame too small');
-    }
-    const view = new DataView(buffer);
-    if (view.getUint32(0, true) !== TENSOR_MAGIC) {
-      throw new Error('bad tensor frame magic');
-    }
-    const version = view.getUint8(4);
-    if (version !== TENSOR_VERSION) {
-      throw new Error(`unsupported tensor frame version ${version}`);
-    }
-
-    const kind = view.getUint8(5) as TensorFrameKind;
-    const dtype = view.getUint8(6) as TensorDType;
-    const rank = view.getUint8(7);
-    const seqId = view.getUint32(8, true);
-    const tokenIndex = view.getUint32(12, true);
-    const fromLayer = view.getUint32(16, true);
-    const toLayer = view.getUint32(20, true);
-    const payloadBytes = view.getUint32(24, true);
-
-    const shape: number[] = [];
-    for (let i = 0; i < rank; i += 1) {
-      shape.push(view.getUint32(TENSOR_HEADER_BYTES + i * 4, true));
-    }
-
-    const offset = TENSOR_HEADER_BYTES + rank * 4;
-    if (offset + payloadBytes !== buffer.byteLength) {
-      throw new Error('tensor payload length mismatch');
-    }
-
-    return {
-      kind,
-      dtype,
-      shape,
-      seqId,
-      tokenIndex,
-      fromLayer,
-      toLayer,
-      data: buffer.slice(offset, offset + payloadBytes),
-    };
-  },
-};
-
-/** Build a forward hidden-state frame from a Float32Array. */
-export function makeForwardFrame(
-  shape: readonly number[],
-  data: Float32Array,
-  meta: { seqId: number; tokenIndex: number; fromLayer: number; toLayer: number },
-): TensorFrame {
-  const payload = new ArrayBuffer(data.byteLength);
-  new Float32Array(payload).set(data);
-  return {
-    kind: TensorFrameKind.Forward,
-    dtype: TensorDType.F32,
-    shape: [...shape],
-    seqId: meta.seqId,
-    tokenIndex: meta.tokenIndex,
-    fromLayer: meta.fromLayer,
-    toLayer: meta.toLayer,
-    data: payload,
-  };
-}
-
-/** Access a forward frame's payload as F32, validating its dtype. */
-export function frameAsFloat32(frame: TensorFrame): Float32Array {
-  if (frame.dtype !== TensorDType.F32) {
-    throw new Error(`expected F32 tensor, got dtype ${frame.dtype}`);
-  }
-  return new Float32Array(frame.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +143,13 @@ export type ControlMessage =
   | { type: 'stage'; stage: StageRange | null }
   | { type: 'capacity'; hostableLayers: number; totalLayers: number; vramBytes: number | null }
   | { type: 'benchmark'; throughput: number; gflops: number; bandwidthGiBps: number }
-  | { type: 'tensor-retransmit'; seqId: number; tokenIndex: number };
+  /**
+   * A downstream stage could not process a sequence. Replaces the old
+   * `tensor-retransmit`: with a reliable tensor channel a bad or unprocessable
+   * payload will not become good on a second sending, so the originator needs
+   * to learn the sequence is dead rather than wait out its timeout.
+   */
+  | { type: 'sequence-failed'; seqId: number; reason: string };
 
 // ---------------------------------------------------------------------------
 // Stage execution
@@ -322,7 +215,17 @@ interface ChannelSpec {
 }
 
 const CONTROL_CHANNEL: ChannelSpec = { id: 0, label: 'meshgpu-control', ordered: true };
-// Unordered with no retransmits = UDP-like, lowest-latency tensor path.
+/**
+ * Unordered but *reliable*.
+ *
+ * The tensor channel used to be no-retransmit, on the theory that dropping a
+ * late tensor beats waiting for it. That is wrong for a forward pass: a lost
+ * hidden state has no replacement, so the sequence simply hangs. At ~7 KiB per
+ * token in f16, letting SCTP retransmit costs almost nothing.
+ *
+ * Ordering stays off deliberately — with several sequences in flight for
+ * microbatching, head-of-line blocking on one would stall all the others.
+ */
 const TENSOR_CHANNEL: ChannelSpec = { id: 1, label: 'meshgpu-tensor', ordered: false };
 
 export const DEFAULT_RTC_CONFIG: RTCConfiguration = {
@@ -332,8 +235,18 @@ export const DEFAULT_RTC_CONFIG: RTCConfiguration = {
 /** Fall back to relay routing if direct P2P hasn't connected within this window. */
 export const ICE_FALLBACK_MS = 3000;
 
-/** Drop tensor sends once the SCTP send buffer exceeds this many bytes. */
-const MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+/**
+ * Pause sending once the SCTP send buffer passes this, and resume when it
+ * drains below it. Previously frames over this threshold were dropped and the
+ * caller never found out; now the sender waits.
+ */
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+/** Give up on a send if the peer's buffer never drains within this window. */
+const DRAIN_TIMEOUT_MS = 30_000;
+
+/** How often to re-check `bufferedAmount` while waiting for it to drain. */
+const DRAIN_POLL_MS = 25;
 
 /** Liveness heartbeat: probe every second; drop a peer after no traffic for 3s. */
 export const HEARTBEAT_INTERVAL_MS = 1000;
@@ -388,6 +301,8 @@ export class PeerLink {
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private readonly pendingLatency = new Map<number, (rttMs: number) => void>();
+  /** Chunks arrive out of order; this holds them until each frame is whole. */
+  private readonly reassembler = new FrameReassembler();
 
   constructor(options: PeerLinkOptions) {
     this.remotePeerId = options.remotePeerId;
@@ -477,11 +392,57 @@ export class PeerLink {
     }
   }
 
-  /** Send a packed tensor frame. Returns false on backpressure/drop. */
-  sendTensor(frame: TensorFrame): boolean {
-    if (this.tensorChannel.readyState !== 'open' || this.closed) return false;
-    if (this.tensorChannel.bufferedAmount > MAX_BUFFERED_BYTES) return false;
-    this.tensorChannel.send(TensorCodec.encode(frame));
+  /**
+   * Send a hidden state, chunking it and waiting whenever the send buffer is
+   * full. Resolves false if the link closed or the buffer never drained —
+   * either way the caller learns, rather than losing the tensor silently.
+   */
+  async sendTensor(
+    shape: readonly number[],
+    values: Float32Array,
+    meta: FrameMeta,
+    options: { dtype?: TensorDType.F32 | TensorDType.F16; maxChunkBytes?: number } = {},
+  ): Promise<boolean> {
+    const chunks = encodeTensor(shape, values, meta, {
+      dtype: options.dtype ?? TensorDType.F16,
+      maxChunkBytes: options.maxChunkBytes ?? DEFAULT_MAX_CHUNK_BYTES,
+    });
+
+    for (const chunk of chunks) {
+      if (this.closed || this.tensorChannel.readyState !== 'open') return false;
+      if (!(await this.awaitDrain())) return false;
+      this.tensorChannel.send(chunk);
+    }
+    return true;
+  }
+
+  /** Send one pre-encoded chunk. Used to satisfy a retransmit request. */
+  sendRawChunk(chunk: ArrayBuffer): boolean {
+    if (this.closed || this.tensorChannel.readyState !== 'open') return false;
+    this.tensorChannel.send(chunk);
+    return true;
+  }
+
+  /**
+   * Wait until the send buffer has room. `bufferedamountlow` is not on the
+   * transport-agnostic channel surface (the in-memory mock has no such event),
+   * so this polls — cheap, since it only runs when the buffer is actually full.
+   */
+  private async awaitDrain(): Promise<boolean> {
+    if (this.tensorChannel.bufferedAmount <= MAX_BUFFERED_BYTES) return true;
+
+    const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+    while (this.tensorChannel.bufferedAmount > MAX_BUFFERED_BYTES) {
+      if (this.closed || this.tensorChannel.readyState !== 'open') return false;
+      if (Date.now() > deadline) {
+        this.callbacks.onError?.(
+          this,
+          new Error(`send buffer to ${this.remotePeerId} did not drain in ${DRAIN_TIMEOUT_MS}ms`),
+        );
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+    }
     return true;
   }
 
@@ -510,17 +471,17 @@ export class PeerLink {
     this.tensorChannel.close();
     this.pc.close();
     this.pendingLatency.clear();
+    this.reassembler.clear();
     this.callbacks.onClose?.(this);
   }
 
   private createChannel(channel: ChannelSpec): DataChannelLike {
-    const init: RTCDataChannelInit = {
+    // No maxRetransmits: unordered delivery, but SCTP still guarantees arrival.
+    return this.pc.createDataChannel(channel.label, {
       negotiated: true,
       id: channel.id,
       ordered: channel.ordered,
-    };
-    if (!channel.ordered) init.maxRetransmits = 0;
-    return this.pc.createDataChannel(channel.label, init);
+    });
   }
 
   private wire(): void {
@@ -554,14 +515,15 @@ export class PeerLink {
     };
 
     this.tensorChannel.onmessage = (event) => {
-      let frame: TensorFrame;
+      let complete: TensorFrame | null;
       try {
-        frame = TensorCodec.decode(event.data as ArrayBuffer);
+        complete = this.reassembler.push(decodeFrame(event.data as ArrayBuffer));
       } catch (err) {
         this.callbacks.onError?.(this, toError(err));
         return;
       }
-      this.callbacks.onTensor?.(this, frame);
+      // Null means more chunks of this frame are still in flight.
+      if (complete) this.callbacks.onTensor?.(this, complete);
     };
   }
 
@@ -801,8 +763,15 @@ export class PipelineMesh {
     this.links.get(peerId)?.sendControl(message);
   }
 
-  sendTensorTo(peerId: string, frame: TensorFrame): boolean {
-    return this.links.get(peerId)?.sendTensor(frame) ?? false;
+  sendTensorTo(
+    peerId: string,
+    shape: readonly number[],
+    values: Float32Array,
+    meta: FrameMeta,
+  ): Promise<boolean> {
+    const link = this.links.get(peerId);
+    if (!link) return Promise.resolve(false);
+    return link.sendTensor(shape, values, meta);
   }
 
   broadcastControl(message: ControlMessage): void {
@@ -911,6 +880,15 @@ export class PipelineMesh {
 // Pipeline node: executes a stage and forwards hidden state to the next peer
 // ---------------------------------------------------------------------------
 
+/** What a node just handed to the next stage. */
+export interface ForwardInfo {
+  seqId: number;
+  tokenIndex: number;
+  shape: number[];
+  fromLayer: number;
+  toLayer: number;
+}
+
 export interface OutputTokenMeta {
   seqId: number;
   tokenIndex: number;
@@ -922,7 +900,7 @@ export interface PipelineNodeCallbacks {
   onPeerDisconnected?: (peerId: string) => void;
   onStageChanged?: (stage: StageRange | null) => void;
   onToken?: (token: number, meta: OutputTokenMeta) => void;
-  onForwarded?: (frame: TensorFrame) => void;
+  onForwarded?: (info: ForwardInfo) => void;
   onError?: (peerId: string, error: Error) => void;
 }
 
@@ -934,6 +912,15 @@ export interface PipelineNodeOptions {
   executor?: StageExecutor;
   createPeerConnection?: PeerConnectionFactory;
   callbacks?: PipelineNodeCallbacks;
+  /**
+   * Sequences this node may have in flight at once. Values above 1 are what
+   * make pipeline parallelism worth anything: at batch 1 only one stage is
+   * busy at a time, so utilisation is 1/N. Several concurrent sequences keep
+   * every stage fed.
+   */
+  maxConcurrent?: number;
+  /** Fail a sequence that produces no token within this window. */
+  runTimeoutMs?: number;
 }
 
 /** Events emitted for external observers (e.g. the dynamic scheduler). */
@@ -949,7 +936,24 @@ interface InFlightEntry {
   sentTo: string;
 }
 
-const FRAME_BUFFER_LIMIT = 64;
+interface PendingRun {
+  resolve: (token: number) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Default concurrent sequences. Four keeps a short pipeline busy without
+ * letting queued work pile up faster than a browser tab can drain it.
+ */
+const DEFAULT_MAX_CONCURRENT = 4;
+
+/**
+ * A sequence that has produced no token in this long is not coming back — a
+ * peer died, or a stage is wedged. Without this the forward pass hangs
+ * forever, which is exactly what the old no-retransmit channel did on a drop.
+ */
+const DEFAULT_RUN_TIMEOUT_MS = 60_000;
 
 function generatePeerId(): string {
   const id =
@@ -967,8 +971,21 @@ export class PipelineNode {
   private readonly callbacks: PipelineNodeCallbacks;
   private readonly topology = new Map<string, StageRange>();
   private readonly listeners = new Set<(event: PipelineNodeEvent) => void>();
-  private readonly sentFrames = new Map<number, TensorFrame>();
   private readonly inFlight = new Map<number, InFlightEntry>();
+  /** Sequences this node started and is still waiting on a token for. */
+  private readonly pendingRuns = new Map<number, PendingRun>();
+  /** Sequences waiting for a slot because maxConcurrent is reached. */
+  private readonly admissionQueue: Array<() => void> = [];
+  /**
+   * Slots taken, counted synchronously at admission.
+   *
+   * This cannot be derived from `pendingRuns.size`: a run is recorded there
+   * only after `await acquireSlot()` resumes, so several concurrent callers
+   * would all see an empty map and admit themselves at once.
+   */
+  private activeSlots = 0;
+  private readonly maxConcurrent: number;
+  private readonly runTimeoutMs: number;
   private stage: StageRange | null = null;
   private seqCounter = 0;
 
@@ -976,6 +993,8 @@ export class PipelineNode {
     this.selfPeerId = options.signaling?.currentPeerId ?? options.peerId ?? generatePeerId();
     this.executor = options.executor ?? new IdentityExecutor();
     this.callbacks = options.callbacks ?? {};
+    this.maxConcurrent = Math.max(1, options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT);
+    this.runTimeoutMs = options.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
 
     this.mesh = new PipelineMesh({
       signaling: options.signaling,
@@ -1121,59 +1140,119 @@ export class PipelineNode {
 
     for (const [seqId, entry] of this.inFlight) {
       if (!next) {
-        void this.finalizeStage(this.stage, entry.hidden, seqId, entry.tokenIndex)
-          .then((token) => {
-            this.mesh.broadcastControl({
-              type: 'token',
-              seqId,
-              tokenIndex: entry.tokenIndex,
-              token,
-            });
-            this.callbacks.onToken?.(token, {
-              seqId,
-              tokenIndex: entry.tokenIndex,
-              fromPeerId: this.selfPeerId,
-            });
-          })
-          .catch((err) => this.callbacks.onError?.(this.selfPeerId, toError(err)));
+        // This node became the last stage — finish the sequence here.
         this.inFlight.delete(seqId);
+        void this.finalizeStage(this.stage, entry.hidden, seqId, entry.tokenIndex)
+          .then((token) => this.deliverToken(seqId, entry.tokenIndex, token))
+          .catch((err) => this.failRun(seqId, toError(err)));
         continue;
       }
 
       if (entry.sentTo !== next.peerId) {
-        const frame = makeForwardFrame(entry.shape, entry.hidden, {
-          seqId,
-          tokenIndex: entry.tokenIndex,
-          fromLayer: next.stage.start,
-          toLayer: next.stage.end,
-        });
-        this.mesh.sendTensorTo(next.peerId, frame);
-        this.sentFrames.set(seqId, frame);
         entry.sentTo = next.peerId;
-        this.callbacks.onForwarded?.(frame);
+        void this.forwardTo(next, seqId, entry.tokenIndex, entry.shape, entry.hidden);
       }
     }
   }
 
   /**
-   * Start a forward pass as the first stage. Returns the output token if this
-   * node is also the last stage, otherwise null (the token is produced and
-   * broadcast by the final stage).
+   * Start a forward pass as the first stage.
+   *
+   * Resolves with the output token once the last stage produces it — whether
+   * that is this node or a peer several hops away. Rejects if the sequence
+   * produces nothing within the run timeout, so a dead peer surfaces as an
+   * error instead of a promise that never settles.
+   *
+   * Several calls may be in flight at once, up to `maxConcurrent`. That is the
+   * point: concurrent sequences are what keep every stage busy.
    */
   async run(
     input: Float32Array,
     shape: readonly number[],
     options: { tokenIndex?: number } = {},
-  ): Promise<number | null> {
+  ): Promise<number> {
     if (!this.stage) throw new Error('this node has no stage assigned');
     if (this.stage.start !== 0) {
       throw new Error('only the first pipeline stage (start = 0) can initiate a forward pass');
     }
 
+    await this.acquireSlot();
+
     const seqId = ++this.seqCounter;
     const tokenIndex = options.tokenIndex ?? 0;
-    const hidden = await this.executeStage(this.stage, input, seqId, tokenIndex);
-    return this.forwardOrFinalize(seqId, tokenIndex, shape, hidden);
+
+    const settled = new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRuns.delete(seqId);
+        this.inFlight.delete(seqId);
+        this.releaseSlot();
+        reject(new Error(`sequence ${seqId} produced no token within ${this.runTimeoutMs}ms`));
+      }, this.runTimeoutMs);
+      this.pendingRuns.set(seqId, { resolve, reject, timer });
+    });
+
+    try {
+      const hidden = await this.executeStage(this.stage, input, seqId, tokenIndex);
+      await this.forwardOrFinalize(seqId, tokenIndex, shape, hidden);
+    } catch (err) {
+      this.failRun(seqId, toError(err));
+    }
+
+    return settled;
+  }
+
+  /** Sequences this node has started and not yet resolved. */
+  get inFlightCount(): number {
+    return this.pendingRuns.size;
+  }
+
+  private acquireSlot(): Promise<void> {
+    if (this.activeSlots < this.maxConcurrent) {
+      this.activeSlots += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.admissionQueue.push(() => {
+        this.activeSlots += 1;
+        resolve();
+      });
+    });
+  }
+
+  private releaseSlot(): void {
+    this.activeSlots = Math.max(0, this.activeSlots - 1);
+    // Handing the slot straight to the next waiter keeps the count balanced.
+    this.admissionQueue.shift()?.();
+  }
+
+  /** Settle a sequence this node started, and let a queued one through. */
+  private deliverToken(seqId: number, tokenIndex: number, token: number): void {
+    this.mesh.broadcastControl({ type: 'token', seqId, tokenIndex, token });
+    this.callbacks.onToken?.(token, { seqId, tokenIndex, fromPeerId: this.selfPeerId });
+    this.settleRun(seqId, token);
+  }
+
+  private settleRun(seqId: number, token: number): void {
+    const pending = this.pendingRuns.get(seqId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingRuns.delete(seqId);
+    this.releaseSlot();
+    pending.resolve(token);
+  }
+
+  private failRun(seqId: number, error: Error): void {
+    const pending = this.pendingRuns.get(seqId);
+    if (!pending) {
+      // Not our sequence — we are a middle stage, so report and move on.
+      this.callbacks.onError?.(this.selfPeerId, error);
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingRuns.delete(seqId);
+    this.inFlight.delete(seqId);
+    this.releaseSlot();
+    pending.reject(error);
   }
 
   private async handleForward(peerId: string, frame: TensorFrame): Promise<void> {
@@ -1185,17 +1264,30 @@ export class PipelineNode {
     const expectedLength = frame.shape.reduce((acc, dim) => acc * dim, 1);
     const check = sanitizeTensor(input, expectedLength);
     if (!check.ok) {
+      // The tensor channel is reliable now, so a bad payload means corruption
+      // or a version mismatch rather than a dropped chunk. Retransmitting the
+      // same bytes would not help; tell the sender so the sequence can fail.
       this.callbacks.onError?.(peerId, new Error(`tensor rejected: ${check.reason}`));
       this.mesh.sendControl(peerId, {
-        type: 'tensor-retransmit',
+        type: 'sequence-failed',
         seqId: frame.seqId,
-        tokenIndex: frame.tokenIndex,
+        reason: check.reason,
       });
       return;
     }
 
-    const hidden = await this.executeStage(this.stage, input, frame.seqId, frame.tokenIndex);
-    await this.forwardOrFinalize(frame.seqId, frame.tokenIndex, frame.shape, hidden);
+    try {
+      const hidden = await this.executeStage(this.stage, input, frame.seqId, frame.tokenIndex);
+      await this.forwardOrFinalize(frame.seqId, frame.tokenIndex, frame.shape, hidden);
+    } catch (err) {
+      const error = toError(err);
+      this.mesh.sendControl(peerId, {
+        type: 'sequence-failed',
+        seqId: frame.seqId,
+        reason: error.message,
+      });
+      this.callbacks.onError?.(this.selfPeerId, error);
+    }
   }
 
   private async forwardOrFinalize(
@@ -1203,36 +1295,48 @@ export class PipelineNode {
     tokenIndex: number,
     shape: readonly number[],
     hidden: Float32Array,
-  ): Promise<number | null> {
+  ): Promise<void> {
     const next = this.nextHop();
 
     if (!next) {
       const token = await this.finalizeStage(this.stage!, hidden, seqId, tokenIndex);
-      this.mesh.broadcastControl({ type: 'token', seqId, tokenIndex, token });
-      this.callbacks.onToken?.(token, {
-        seqId,
-        tokenIndex,
-        fromPeerId: this.selfPeerId,
-      });
-      return token;
+      this.deliverToken(seqId, tokenIndex, token);
+      return;
     }
 
-    const frame = makeForwardFrame(shape, hidden, {
-      seqId,
-      tokenIndex,
-      fromLayer: next.stage.start,
-      toLayer: next.stage.end,
-    });
-    this.mesh.sendTensorTo(next.peerId, frame);
-    this.rememberFrame(seqId, frame);
+    // Keep the hidden state so the sequence can be re-routed if the next hop
+    // dies before it answers.
     this.inFlight.set(seqId, {
       hidden,
       shape: [...shape],
       tokenIndex,
       sentTo: next.peerId,
     });
-    this.callbacks.onForwarded?.(frame);
-    return null;
+    await this.forwardTo(next, seqId, tokenIndex, shape, hidden);
+  }
+
+  private async forwardTo(
+    next: { peerId: string; stage: StageRange },
+    seqId: number,
+    tokenIndex: number,
+    shape: readonly number[],
+    hidden: Float32Array,
+  ): Promise<void> {
+    const meta: FrameMeta = {
+      seqId,
+      tokenIndex,
+      fromLayer: next.stage.start,
+      toLayer: next.stage.end,
+    };
+
+    const sent = await this.mesh.sendTensorTo(next.peerId, shape, hidden, meta);
+    if (!sent) {
+      // The old code ignored this and reported success; a full or closed
+      // channel silently ate the tensor.
+      this.failRun(seqId, new Error(`could not send sequence ${seqId} to ${next.peerId}`));
+      return;
+    }
+    this.callbacks.onForwarded?.({ ...meta, shape: [...shape] });
   }
 
   private async executeStage(
@@ -1280,29 +1384,24 @@ export class PipelineNode {
         else this.topology.delete(peerId);
         break;
       case 'token':
-        this.sentFrames.delete(message.seqId);
         this.inFlight.delete(message.seqId);
         this.callbacks.onToken?.(message.token, {
           seqId: message.seqId,
           tokenIndex: message.tokenIndex,
           fromPeerId: peerId,
         });
+        // If we started this sequence, the last stage's token is what our
+        // run() promise has been waiting for.
+        this.settleRun(message.seqId, message.token);
         break;
-      case 'tensor-retransmit': {
-        const frame = this.sentFrames.get(message.seqId);
-        if (frame) this.mesh.sendTensorTo(peerId, frame);
+      case 'sequence-failed':
+        this.failRun(
+          message.seqId,
+          new Error(`stage on ${peerId} failed sequence ${message.seqId}: ${message.reason}`),
+        );
         break;
-      }
       default:
         break;
-    }
-  }
-
-  private rememberFrame(seqId: number, frame: TensorFrame): void {
-    this.sentFrames.set(seqId, frame);
-    if (this.sentFrames.size > FRAME_BUFFER_LIMIT) {
-      const oldest = this.sentFrames.keys().next().value;
-      if (oldest !== undefined) this.sentFrames.delete(oldest);
     }
   }
 
@@ -1343,9 +1442,10 @@ if (typeof window !== 'undefined' && import.meta.env.DEV) {
     PipelineMesh,
     PipelineNode,
     IdentityExecutor,
-    TensorCodec,
-    makeForwardFrame,
+    encodeTensor,
+    decodeFrame,
     frameAsFloat32,
+    FrameReassembler,
     TensorDType,
     TensorFrameKind,
     DEFAULT_RTC_CONFIG,
