@@ -52,7 +52,7 @@ MeshGPU has two modes, and they are very different in maturity:
 | **Model allowlists** | ✅ Works | Per-key, plus a mesh-wide block list |
 | **Audit log** | ✅ Works | Who asked what, when, served by whom — prompt hashes, not text |
 | **Admin console** | ✅ Works | Served at `/admin`; issue keys, watch workers, read the log |
-| **SSO / OIDC** | ❌ Not yet | Keys are the unit of identity; no IdP integration |
+| **SSO / OIDC** | ✅ Works | Bearer tokens from your IdP; groups map to scopes; works air-gapped |
 | **Multi-peer shard mesh (3+)** | ❌ Not yet | Peer IDs fixed to `host`/`joiner`; a third device is unsupported |
 | **Pretrained weight loading** | ❌ Not yet | No safetensors reader, no tokenizer — the gap to serving a real model |
 | **Quantized kernels** | ❌ Not yet | f32 weights only, so a real model would not fit in a browser's budget |
@@ -196,6 +196,51 @@ SHA-256 is stored. Revoking takes effect on the next request; the console
 refuses to revoke the last admin key, because locking every administrator out
 of a box on a shelf is not recoverable.
 
+### Single sign-on
+
+Point the mesh at your identity provider and access follows the directory
+instead of a key someone pasted into Slack:
+
+```bash
+MESH_OIDC_ISSUER=https://login.microsoftonline.com/<tenant>/v2.0
+MESH_OIDC_AUDIENCE=api://meshgpu
+MESH_OIDC_SCOPE_MAP='mesh-admins=admin,chat,serve;engineering=chat,serve;everyone=chat'
+```
+
+Any bearer token that provider issues is then accepted alongside API keys.
+Group membership decides scopes; a user in no mapped group gets
+`MESH_OIDC_DEFAULT_SCOPES` (`chat` by default). The audit log records the
+person's subject and email rather than a key name, and quotas follow the
+subject across token refreshes — signing in twice does not reset anyone's
+budget.
+
+Tokens are verified against the provider's published keys, discovered from
+`/.well-known/openid-configuration` and cached. Only asymmetric signatures are
+accepted (`RS256` and `ES256` by default), which is what makes the classic
+`alg: none` and HMAC-confusion forgeries structurally impossible rather than
+merely checked for.
+
+**Air-gapped meshes** cannot reach an IdP. Export the key set once and carry it
+across:
+
+```bash
+MESH_OIDC_JWKS_FILE=/etc/meshgpu/jwks.json
+```
+
+Nothing is fetched in that mode. Rotating keys means replacing the file.
+
+| Variable | | |
+| --- | --- | --- |
+| `MESH_OIDC_ISSUER` | — | Enables OIDC. Matched exactly against `iss`. |
+| `MESH_OIDC_AUDIENCE` | — | Comma-separated. Unset accepts any audience — set it. |
+| `MESH_OIDC_SCOPE_MAP` | — | `group=scope,scope;group=scope` |
+| `MESH_OIDC_DEFAULT_SCOPES` | `chat` | For users in no mapped group |
+| `MESH_OIDC_JWKS_URI` | discovered | Skip discovery |
+| `MESH_OIDC_JWKS_FILE` | — | Static key set, for air-gapped meshes |
+| `MESH_OIDC_ALGORITHMS` | `RS256,ES256` | Asymmetric only; HMAC is never accepted |
+| `MESH_OIDC_DAILY_LIMIT` | `0` | Per-subject daily quota |
+| `MESH_OIDC_PER_MINUTE` | `0` | Per-subject rate limit |
+
 ### What the audit log records
 
 By default, every request produces an entry naming the key, the model, the
@@ -328,12 +373,12 @@ elsewhere, but capacity is only as reliable as people's browsing habits. This
 is a real operational difference from a dedicated server and you should plan
 around it rather than hope.
 
-**Identity is a key, not a person.** Each key has a name, scopes, quotas and
-an allowlist, and can be revoked on its own — enough to answer "who ran this"
-and "cut off that laptop". What it is not is single sign-on: there is no IdP
-integration, so a leaver's access ends when someone revokes their key, not when
-their directory account is disabled. For a small team that is a process
-problem; for a large one it is a gap.
+**Access is only as current as your token lifetime.** With OIDC, disabling
+someone in the directory ends their access when their current token expires —
+not the instant you click. Short token lifetimes narrow that window; nothing
+closes it entirely, because the mesh validates signatures rather than calling
+the IdP on every request. That is the normal trade for stateless bearer tokens,
+and worth knowing before you rely on it for offboarding.
 
 **Prompts pass through the coordinator.** In Pool mode the request path is
 client → coordinator → browser tab. Everything stays on the LAN, and by default
@@ -382,9 +427,11 @@ mid-request, and needs no tensor streaming.
 **Done — the governance layer.** Named keys with scopes, per-key quotas, model
 allowlists, a privacy-preserving audit log, and an admin console.
 
-**Next — SSO and release integrity.** OIDC so identity comes from the
-organisation's directory rather than a key someone pasted into Slack; signed
-releases and an SBOM so what you run is what was published.
+**Done — single sign-on.** OIDC bearer tokens validated against your IdP's
+JWKS, with group membership deciding scopes.
+
+**Next — release integrity.** Signed releases and an SBOM, so what you run is
+verifiably what was published.
 
 **Then — transport hardening.** Frame chunking and an f16 wire format so
 prefill-sized tensors survive the DataChannel; retransmit deadlines so a
@@ -461,6 +508,7 @@ coordinator/
 │   ├── quota.js             # Per-key daily and per-minute limits
 │   ├── audit.js             # Append-only log, hashed prompts by default
 │   ├── admin.js             # Admin API: keys, audit, settings
+│   ├── oidc.js              # JWT verification against an IdP's JWKS
 │   ├── store.js             # Atomic JSON persistence — no database to install
 │   └── http.js              # Shared request/response helpers
 └── test/                    # Unit + full HTTP/WebSocket integration tests

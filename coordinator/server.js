@@ -31,6 +31,7 @@ import { Identity, SCOPES, hasScope, mayUseModel } from './lib/identity.js';
 import { Quota } from './lib/quota.js';
 import { AuditLog, RETENTION } from './lib/audit.js';
 import { handleAdminApi } from './lib/admin.js';
+import { OidcVerifier } from './lib/oidc.js';
 import {
   completionBody,
   errorBody,
@@ -80,6 +81,21 @@ store.flush();
 
 // Usage rows accumulate one per key per day; trim on startup.
 quota.prunePastDays(32);
+
+/**
+ * Optional single sign-on. When MESH_OIDC_ISSUER is set, bearer tokens issued
+ * by that provider are accepted alongside MeshGPU API keys, and group
+ * membership decides scopes. Access then follows the directory: disabling
+ * someone's account ends their access at the next token expiry, without an
+ * administrator remembering to revoke a key.
+ */
+let oidc = null;
+try {
+  oidc = OidcVerifier.fromEnv();
+} catch (error) {
+  console.error(`[meshgpu] OIDC configuration is invalid: ${error.message}`);
+  process.exit(1);
+}
 
 const registry = new WorkerRegistry();
 const queue = new JobQueue({
@@ -160,7 +176,7 @@ async function handleChatCompletions(req, res, principal) {
       model,
       outcome: 'denied',
       prompt: promptText,
-      detail: { reason: message },
+      detail: { reason: message, via: principal.via ?? 'api-key' },
     });
     sendJson(res, status, errorBody(message, type, code), extraHeaders);
   };
@@ -197,7 +213,7 @@ async function handleChatCompletions(req, res, principal) {
       durationMs: Date.now() - startedAt,
       prompt: promptText,
       completion,
-      detail,
+      detail: { via: principal.via ?? 'api-key', ...(detail ?? {}) },
     });
   };
 
@@ -268,11 +284,34 @@ async function handleChatCompletions(req, res, principal) {
 }
 
 /**
- * Resolve the caller. Returns the key record, or null — callers must not
- * distinguish "unknown key" from "revoked key" in what they send back.
+ * Resolve the caller from either credential type.
+ *
+ * API keys are checked first because they are cheap and local. A JWT is only
+ * attempted when it actually looks like one, so a mistyped API key does not
+ * produce a confusing token-validation error.
+ *
+ * Returns the principal, or null — callers must not distinguish "unknown",
+ * "revoked" and "expired" in what they send back.
  */
-function authenticate(req) {
-  return identity.verify(bearerFrom(req));
+async function authenticate(req) {
+  return authenticateToken(bearerFrom(req));
+}
+
+async function authenticateToken(token) {
+  const record = identity.verify(token);
+  if (record) return record;
+
+  if (oidc && OidcVerifier.looksLikeJwt(token)) {
+    try {
+      return await oidc.verify(token);
+    } catch (error) {
+      // Logged, not returned: a caller learning *why* their token failed
+      // learns about the mesh's configuration too.
+      log(`rejected OIDC token: ${error.message}`);
+      return null;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +319,13 @@ function authenticate(req) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((error) => {
+    if (res.headersSent) return res.end();
+    sendJson(res, error.status ?? 500, errorBody(error.message, error.code ?? 'server_error'));
+  });
+});
+
+async function handleRequest(req, res) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const route = url.pathname;
 
@@ -301,9 +347,9 @@ const server = http.createServer((req, res) => {
   const needsAuth = route.startsWith('/v1/') || route.startsWith('/admin/') || route === '/status';
   let principal = null;
   if (needsAuth) {
-    principal = authenticate(req);
+    principal = await authenticate(req);
     if (!principal) {
-      return sendJson(res, 401, errorBody('missing or invalid API key', 'authentication_error'));
+      return sendJson(res, 401, errorBody('missing or invalid credentials', 'authentication_error'));
     }
   }
 
@@ -312,7 +358,7 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 403, errorBody('this key lacks the admin scope', 'permission_error'));
     }
     return handleAdminApi(
-      { identity, quota, audit, store, registry, queue, principal },
+      { identity, quota, audit, store, registry, queue, principal, oidc },
       req,
       res,
       url,
@@ -368,7 +414,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET') return serveStatic(req, res);
   sendJson(res, 404, errorBody(`no route for ${route}`, 'invalid_request_error'));
-});
+}
 
 /** Send a single file, used for the admin console shell. */
 function serveFile(res, filePath, contentType) {
@@ -386,12 +432,16 @@ function serveFile(res, filePath, contentType) {
 const wss = new WebSocketServer({ server, path: '/mesh' });
 
 wss.on('connection', (socket, req) => {
+  void acceptWorker(socket, req).catch(() => socket.close(4401, 'invalid credentials'));
+});
+
+async function acceptWorker(socket, req) {
   const url = new URL(req.url ?? '/mesh', 'http://localhost');
-  // Browsers cannot set headers on a WebSocket handshake, so the key comes in
-  // the query string. It never leaves the LAN and is never written to the log.
-  const principal = identity.verify(url.searchParams.get('token'));
+  // Browsers cannot set headers on a WebSocket handshake, so the credential
+  // comes in the query string. It never leaves the LAN and is never logged.
+  const principal = await authenticateToken(url.searchParams.get('token'));
   if (!principal) {
-    socket.close(4401, 'invalid key');
+    socket.close(4401, 'invalid credentials');
     return;
   }
   if (!hasScope(principal, SCOPES.SERVE)) {
@@ -476,7 +526,7 @@ wss.on('connection', (socket, req) => {
 
   socket.on('close', () => drop('closed'));
   socket.on('error', () => drop('socket error'));
-});
+}
 
 // Drop workers whose tab was suspended or whose machine slept.
 const heartbeat = setInterval(() => {
@@ -547,6 +597,7 @@ server.listen(PORT, HOST, async () => {
   log(`coordinator listening on http://${primary}:${PORT}`);
   log(`OpenAI endpoint:  http://${primary}:${PORT}/v1`);
   log(`Admin console:    http://${primary}:${PORT}/admin`);
+  log(`Sign-in:          ${oidc ? `OIDC (${oidc.issuer}) + API keys` : 'API keys'}`);
   log(`Audit retention:  ${audit.retention}${audit.retention === RETENTION.FULL ? '  *** PROMPT TEXT IS BEING STORED ***' : ' (prompt text is not stored)'}`);
   log(`State file:       ${STATE_FILE}`);
   console.log('');
@@ -583,4 +634,4 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-export { server, registry, queue, identity, quota, audit, store };
+export { server, registry, queue, identity, quota, audit, store, oidc };

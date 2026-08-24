@@ -27,7 +27,7 @@ export async function handleAdminApi(ctx, req, res, url) {
   const { pathname } = url;
   if (!pathname.startsWith('/admin/api/')) return false;
 
-  const { identity, quota, audit, store, registry, queue, principal } = ctx;
+  const { identity, quota, audit, store, registry, queue, principal, oidc } = ctx;
 
   // Overview — everything the console's front page needs, in one round trip.
   if (pathname === '/admin/api/overview' && req.method === 'GET') {
@@ -41,6 +41,9 @@ export async function handleAdminApi(ctx, req, res, url) {
       retention: audit.retention,
       settings: store.state.settings,
       auditWriteError: audit.lastWriteError ?? null,
+      oidc: oidc
+        ? { enabled: true, issuer: oidc.issuer, audiences: oidc.audiences, scopeMap: oidc.scopeMap }
+        : { enabled: false },
     });
     return true;
   }

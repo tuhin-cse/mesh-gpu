@@ -331,10 +331,12 @@
       alerts.push(`<div class="banner error"><strong>The audit log is not being written.</strong> Last failure ${esc(o.auditWriteError)}. Requests are still being served, but they are not being recorded.</div>`);
     }
     $('alerts').innerHTML = alerts.join('');
-    $('retention-note').textContent =
+    const retentionText =
       o.retention === 'full' ? 'audit: full prompt text'
       : o.retention === 'none' ? 'audit: no content recorded'
       : 'audit: prompt hashes only';
+    const signIn = o.oidc?.enabled ? `sign-in: ${o.oidc.issuer} + API keys` : 'sign-in: API keys';
+    $('retention-note').textContent = `${signIn} · ${retentionText}`;
   }
 
   // ---------- create ----------
