@@ -1,21 +1,26 @@
 /**
  * web-llm.ts
  *
- * Reference single-node inference runtime backed by @mlc-ai/web-llm. One
- * browser tab downloads a quantized model and runs it end-to-end on its local
- * WebGPU device via `MLCEngine`.
+ * Single-node inference runtime backed by @mlc-ai/web-llm. One browser tab
+ * downloads a quantized model and runs it end-to-end on its local WebGPU
+ * device.
+ *
+ * By default the engine runs in a dedicated Web Worker, so model loading,
+ * shader compilation and generation never block the page. That matters most
+ * when the tab is contributing to a mesh: the machine's owner keeps working
+ * while their GPU serves other people.
  *
  * Architecture note: WebLLM's public API runs a whole model through
  * `engine.chat.completions.create()` and does not expose per-layer execution,
- * so true layer-sharding across peers requires forking WebLLM / tvmjs
- * internals (out of MVP scope). This module validates the full WebGPU
- * inference path on one node — the baseline the sharded pipeline will replace.
+ * so sharding a single model across peers cannot be built on it. This runtime
+ * powers both the local chat card and "Pool" mode, where each peer holds a
+ * complete model and requests are routed between peers.
  */
 
 import type {
   ChatCompletionMessageParam,
   InitProgressReport,
-  MLCEngine,
+  MLCEngineInterface,
 } from '@mlc-ai/web-llm';
 
 export type WebLLMStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -50,11 +55,30 @@ function loadWebLLM(): Promise<typeof import('@mlc-ai/web-llm')> {
   return import('@mlc-ai/web-llm');
 }
 
+export interface WebLLMRuntimeOptions {
+  /**
+   * Run the engine on a worker thread. Defaults to true; set false only to
+   * debug against the main-thread engine.
+   */
+  useWorker?: boolean;
+}
+
 export class WebLLMRuntime {
-  private engine: MLCEngine | null = null;
+  private engine: MLCEngineInterface | null = null;
+  private worker: Worker | null = null;
   private currentModelId: string | null = null;
   private status: WebLLMStatus = 'idle';
   private lastError: string | null = null;
+  private readonly useWorker: boolean;
+
+  constructor(options: WebLLMRuntimeOptions = {}) {
+    this.useWorker = options.useWorker ?? true;
+  }
+
+  /** The live engine, or null when no model is loaded. */
+  get currentEngine(): MLCEngineInterface | null {
+    return this.isReady ? this.engine : null;
+  }
 
   get isReady(): boolean {
     return this.status === 'ready' && this.engine !== null;
@@ -83,7 +107,7 @@ export class WebLLMRuntime {
 
     try {
       const webllm = await loadWebLLM();
-      this.engine = await webllm.CreateMLCEngine(modelId, {
+      const config = {
         initProgressCallback: (report: InitProgressReport) => {
           onProgress?.({
             progress: report.progress,
@@ -91,7 +115,16 @@ export class WebLLMRuntime {
             timeElapsed: report.timeElapsed,
           });
         },
-      });
+      };
+
+      if (this.useWorker) {
+        this.worker = new Worker(new URL('./webllm-worker.ts', import.meta.url), {
+          type: 'module',
+        });
+        this.engine = await webllm.CreateWebWorkerMLCEngine(this.worker, modelId, config);
+      } else {
+        this.engine = await webllm.CreateMLCEngine(modelId, config);
+      }
       this.status = 'ready';
     } catch (err) {
       this.status = 'error';
@@ -151,16 +184,20 @@ export class WebLLMRuntime {
   }
 
   private async disposeEngine(): Promise<void> {
-    if (!this.engine) return;
-    try {
-      // `unload()` releases the GPU buffers holding the weights. `resetChat()`
-      // only clears conversation state, so relying on it leaks the whole model
-      // every time the user switches to a different one.
-      await this.engine.unload();
-    } catch {
-      // Best-effort teardown — the engine is dropped regardless.
+    if (this.engine) {
+      try {
+        // `unload()` releases the GPU buffers holding the weights. `resetChat()`
+        // only clears conversation state, so relying on it leaks the whole
+        // model every time the user switches to a different one.
+        await this.engine.unload();
+      } catch {
+        // Best-effort teardown — the engine is dropped regardless.
+      }
+      this.engine = null;
     }
-    this.engine = null;
+    // Terminating the worker releases its WebGPU device along with it.
+    this.worker?.terminate();
+    this.worker = null;
   }
 }
 

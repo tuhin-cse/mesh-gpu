@@ -19,6 +19,7 @@ import { VramGauge } from './components/VramGauge';
 import { TopologyGraph } from './components/TopologyGraph';
 import type { TopologyEdge, TopologyNode } from './components/TopologyGraph';
 import { ChatUI } from './components/ChatUI';
+import { ContributeCard } from './components/ContributeCard';
 import { QRHandshakeModal } from './components/QRHandshakeModal';
 
 type InspectState =
@@ -132,6 +133,8 @@ export default function App() {
           vramBytes={info?.estimatedVRAMBytes ?? null}
           device={info?.device ?? null}
         />
+
+        <ContributeCard />
 
         <ChatUI />
 

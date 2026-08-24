@@ -12,7 +12,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "test:e2e:manual": "playwright test tests/e2e-manual-handshake.spec.ts"
+    "test:e2e:manual": "playwright test tests/e2e-manual-handshake.spec.ts",
+    "coordinator": "node coordinator/server.js",
+    "coordinator:install": "npm --prefix coordinator install",
+    "mesh": "npm run build && node coordinator/server.js"
   },
   "engines": {
     "node": ">=18"

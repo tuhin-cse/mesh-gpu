@@ -23,11 +23,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install coordinator dependencies
+        run: npm --prefix coordinator ci
+
       # 1. TypeScript type validation (app + node configs).
       - name: Typecheck
         run: npm run typecheck
 
-      # 2. Unit tests: tensor wire format + scheduler invariants (Vitest).
+      # 2. Unit + integration tests: wire format, scheduler invariants,
+      #    worker routing, and the OpenAI endpoint end to end (Vitest).
       - name: Unit tests
         run: npm test
 
