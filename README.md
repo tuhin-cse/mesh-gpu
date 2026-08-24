@@ -16,12 +16,15 @@ MeshGPU has two modes, and they are very different in maturity:
 > Throughput scales with the number of people who leave the tab open, and a tab
 > closing costs at most one retry. [Jump to the quickstart](#quickstart-pool-mode).
 >
-> ### **Shard mode — not implemented.**
-> Splitting one model's layers across peers. The transport, handshake and layer
-> scheduler are built and tested, but what travels between peers today comes
-> from an *identity executor* that forwards tensors unchanged. No transformer
-> layer executes on a remote peer. See [Roadmap](#roadmap) and
-> [Honest limitations](#honest-limitations).
+> ### **Shard mode — the compute path works; weight loading does not.**
+> Splitting one model's layers across peers. Real decoder layers now execute on
+> WebGPU — RMSNorm, RoPE, grouped-query attention over a KV cache, SwiGLU —
+> verified element-by-element against a reference implementation. The transport
+> carries prefill-sized tensors, retries, and runs several sequences at once.
+>
+> What is missing is the boring part: there is **no safetensors reader and no
+> tokenizer**, so it cannot load a pretrained model and serve text yet. See
+> [Roadmap](#roadmap) and [Honest limitations](#honest-limitations).
 
 ---
 
@@ -39,10 +42,15 @@ MeshGPU has two modes, and they are very different in maturity:
 | **Serverless QR pairing** | ✅ Works | Full SDP + ICE compressed into one QR code or Base64 string |
 | **Binary tensor transport** | ✅ Works | 32-byte framed wire format over a DataChannel, round-trip tested |
 | **Layer scheduler** | ✅ Works | Deterministic, throughput-weighted, memory-capped (2 peers) |
+| **Chunked f16 tensor wire** | ✅ Works | Prefill-sized tensors split, reassemble out of order, tolerate duplicates |
+| **Reliable tensor transport** | ✅ Works | Backpressure honoured, per-sequence deadlines, no silent drops |
+| **Microbatching** | ✅ Works | Several sequences in flight at once — what makes sharding pay off |
+| **WebGPU decoder layers** | ✅ Works | Verified against a reference implementation to ~2e-5 |
+| **Measured GPU budget** | ✅ Works | Allocates until the device refuses, instead of guessing from a device name |
 | **Auth** | ⚠️ Basic | One shared token for the whole mesh — no per-user identity, no SSO |
-| **VRAM estimation** | ⚠️ Approximate | Parsed from the adapter description; often unavailable |
 | **Multi-peer shard mesh (3+)** | ❌ Not yet | Peer IDs fixed to `host`/`joiner`; a third device is unsupported |
-| **Sharded inference** | ❌ Not yet | `IdentityExecutor` is the only executor in the codebase |
+| **Pretrained weight loading** | ❌ Not yet | No safetensors reader, no tokenizer — the gap to serving a real model |
+| **Quantized kernels** | ❌ Not yet | f32 weights only, so a real model would not fit in a browser's budget |
 
 ---
 
@@ -243,14 +251,18 @@ admin rights, works on a locked-down laptop — not performance. If you control
 the machines, [exo](https://github.com/exo-explore/exo) and
 [llama.cpp](https://github.com/ggml-org/llama.cpp) will be faster.
 
-**VRAM estimates are approximations.** Browsers do not expose dedicated VRAM.
-MeshGPU parses `GPUAdapterInfo.description` against a hardcoded device table,
-falling back to `navigator.deviceMemory`. Chrome frequently returns empty
-strings for these fields, in which case no estimate is available and the node
-reports zero capacity. Even a correct answer overstates what a browser tab can
-actually allocate — `maxBufferSize` is typically capped near 2 GiB and the
-per-process GPU budget is well below the card's physical memory. Treat these
-numbers as indicative.
+**Shard mode cannot serve a real model yet.** The kernels are correct and the
+transport is sound, but loading pretrained weights needs a safetensors reader,
+and turning text into tokens needs a tokenizer. Neither exists here. On top of
+that the kernels are f32-only: a 7B model at f32 is 30 GB, far past any
+browser's budget, so quantized matmuls are a prerequisite rather than an
+optimisation. Treat shard mode as a verified foundation, not a product.
+
+**GPU memory is now measured rather than guessed**, which is more honest but
+also lower than you might expect. `probeGpuBudget` allocates buffers until the
+device refuses; the number it returns is what a browser tab can actually have,
+which is well under the card's physical memory. A machine advertising 24 GB may
+report a small fraction of it.
 
 **Pool mode needs the tab open.** A contributor who closes the tab, sleeps the
 laptop, or walks out of Wi-Fi range leaves the mesh. In-flight work is retried
@@ -316,14 +328,19 @@ prefill-sized tensors survive the DataChannel; retransmit deadlines so a
 dropped frame cannot stall a forward pass indefinitely; honouring the
 backpressure signal instead of dropping frames silently.
 
-**Then — real sharded inference.** WebLLM's public API runs whole models and
-cannot express per-layer execution, so this means ONNX Runtime Web with a
-manually split graph, or a purpose-built WGSL kernel set — plus a sharded KV
-cache, which is the part most people underestimate.
+**Done — transport hardening.** Chunking, f16, reliable delivery, backpressure,
+per-sequence deadlines, microbatching, and a measured GPU budget.
+
+**Done — the sharded compute path.** Real decoder layers on WebGPU with a
+per-sequence KV cache, verified against a reference implementation.
+
+**Next — make shard mode able to serve a model.** A safetensors reader to load
+pretrained weights, a tokenizer, and quantized (q4/q8) matmul kernels so a real
+model fits in a browser's measured budget. This is the remaining gap, and it is
+substantial.
 
 **Also needed** — mesh support beyond two peers with real peer identities and
-capacity gossip; authenticated pairing; empirical memory probing to replace the
-device lookup table; microbatching so concurrent requests fill the pipeline.
+capacity gossip; authenticated pairing for the QR path.
 
 ---
 
@@ -350,6 +367,11 @@ src/
 │   ├── p2p-pipeline.ts      # DataChannel tensor streaming + forwarding
 │   ├── scheduler.ts         # Deterministic throughput-weighted assignment
 │   ├── mock-transport.ts    # In-memory RTC mock (headless tests)
+│   ├── tensor-wire.ts       # v2 wire format: chunking, f16, reassembly
+│   ├── gpu-budget.ts        # Measures real allocatable GPU memory
+│   ├── transformer.ts       # Config, weights, CPU reference layer
+│   ├── transformer-gpu.ts   # GpuTransformerStage — layers on WebGPU
+│   ├── wgsl/layer.ts        # Compute kernels for one decoder layer
 │   ├── web-llm.ts           # WebLLM runtime (worker-threaded)
 │   ├── scheduler.test.ts    # Scheduler invariants + randomised properties
 │   ├── tensor-codec.test.ts # Wire format round-trip + malformed-input tests
@@ -386,6 +408,7 @@ npm run coordinator:install  # coordinator deps (ws, bonjour-service)
 npm run typecheck            # tsc --noEmit (app + node configs)
 npm test                     # Vitest: client units + coordinator unit & integration
 npm run test:e2e:manual      # Playwright: manual handshake + MockTransport streaming
+npm run test:e2e:gpu         # Playwright: WebGPU kernels vs the reference
 npm run build                # typecheck + production build → dist/
 
 npm run mesh                 # build, then serve the frontend + coordinator
@@ -395,6 +418,10 @@ npm run coordinator          # coordinator only (expects an existing dist/)
 The coordinator integration suite starts a real HTTP server, connects a fake
 WebSocket worker, and drives the OpenAI endpoint end to end — so routing,
 streaming, auth and failover are covered without a GPU or a model download.
+
+`test:e2e:gpu` runs the same weights through both the reference implementation
+and the WebGPU kernels and compares them element by element. It skips itself
+when there is no WebGPU adapter, so it is a local gate rather than a CI one.
 
 Enable the in-memory mock transport (no real WebRTC) with `?mockP2P=true` or
 `VITE_USE_MOCK_P2P=true` — used by the **Mock P2P Mesh** demo card and the
