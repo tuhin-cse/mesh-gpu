@@ -15,7 +15,8 @@
     "test:e2e:manual": "playwright test tests/e2e-manual-handshake.spec.ts",
     "coordinator": "node coordinator/server.js",
     "coordinator:install": "npm --prefix coordinator install",
-    "mesh": "npm run build && node coordinator/server.js"
+    "mesh": "npm run build && node coordinator/server.js",
+    "test:e2e:gpu": "playwright test tests/gpu-executor.spec.ts"
   },
   "engines": {
     "node": ">=18"

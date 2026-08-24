@@ -1456,3 +1456,16 @@ if (typeof window !== 'undefined' && import.meta.env.DEV) {
     MANUAL_RTC_CONFIG,
   };
 }
+
+// Transformer internals get their own hook so the GPU kernels can be checked
+// against the reference implementation in a real browser.
+if (typeof window !== 'undefined' && import.meta.env.DEV) {
+  void Promise.all([import('./transformer'), import('./transformer-gpu')]).then(
+    ([reference, gpu]) => {
+      (window as unknown as { meshTransformer?: unknown }).meshTransformer = {
+        ...reference,
+        GpuTransformerStage: gpu.GpuTransformerStage,
+      };
+    },
+  );
+}
