@@ -83,8 +83,11 @@ export default function App() {
               Browser-native GPU mesh — WebGPU capability probing, serverless WebRTC pairing and
               a peer-to-peer tensor transport. Sharded inference is not implemented yet.
             </p>
-            <span className="mt-3 inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300">
-              100% Air-Gapped &amp; Offline — No Server Data Traversal
+            <span
+              className="mt-3 inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300"
+              title="The QR/Base64 handshake uses no signaling server and an empty ICE server list, so pairing and tensor traffic stay on your subnet."
+            >
+              QR pairing is serverless — traffic stays on your LAN
             </span>
           </div>
           {info ? (

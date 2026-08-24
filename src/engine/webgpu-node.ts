@@ -278,7 +278,9 @@ export function estimateVRAM(adapterInfo: AdapterInfoSummary): VRAMEstimate {
     return {
       vramBytes: deviceMemoryGiB * GiB,
       source: 'unified-memory-heuristic',
-      note: `Unified memory fallback: navigator.deviceMemory ≈ ${deviceMemoryGiB} GiB`,
+      note:
+        `Unified memory fallback: navigator.deviceMemory ≈ ${deviceMemoryGiB} GiB. `
+        + 'Browsers clamp this value at 8 GiB, so machines with more memory are under-reported.',
     };
   }
 
