@@ -1,0 +1,9 @@
+# The coordinator is a long-lived Node process with WebSocket connections.
+# Vercel's serverless model cannot host it — it runs on a machine inside the
+# LAN it serves. Only the static frontend is deployed here.
+coordinator/
+tests/
+test-results/
+playwright-report/
+*.md
+!README.md
