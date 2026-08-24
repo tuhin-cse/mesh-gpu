@@ -47,7 +47,12 @@ MeshGPU has two modes, and they are very different in maturity:
 | **Microbatching** | ✅ Works | Several sequences in flight at once — what makes sharding pay off |
 | **WebGPU decoder layers** | ✅ Works | Verified against a reference implementation to ~2e-5 |
 | **Measured GPU budget** | ✅ Works | Allocates until the device refuses, instead of guessing from a device name |
-| **Auth** | ⚠️ Basic | One shared token for the whole mesh — no per-user identity, no SSO |
+| **Named API keys** | ✅ Works | Per-person keys with scopes, hashed at rest, revocable individually |
+| **Quotas** | ✅ Works | Per-key daily and per-minute limits, surviving a restart |
+| **Model allowlists** | ✅ Works | Per-key, plus a mesh-wide block list |
+| **Audit log** | ✅ Works | Who asked what, when, served by whom — prompt hashes, not text |
+| **Admin console** | ✅ Works | Served at `/admin`; issue keys, watch workers, read the log |
+| **SSO / OIDC** | ❌ Not yet | Keys are the unit of identity; no IdP integration |
 | **Multi-peer shard mesh (3+)** | ❌ Not yet | Peer IDs fixed to `host`/`joiner`; a third device is unsupported |
 | **Pretrained weight loading** | ❌ Not yet | No safetensors reader, no tokenizer — the gap to serving a real model |
 | **Quantized kernels** | ❌ Not yet | f32 weights only, so a real model would not fit in a browser's budget |
@@ -162,6 +167,56 @@ export OPENAI_API_KEY=kR3xP-9Wq2vLmZ
 `GET /status` shows who is on the mesh and what they are serving. `GET /healthz`
 needs no key and is there for uptime checks.
 
+### Running a governed mesh
+
+Everything above works with one key. For a team you want one key per person, so
+you can see who used what and cut off a laptop without rotating for everyone.
+
+Open the **admin console** printed at startup:
+
+```
+http://192.168.1.24:8080/admin
+```
+
+Sign in with the admin key, then issue keys with the scopes and limits each
+person needs:
+
+| Scope | Lets the key |
+| --- | --- |
+| `chat` | Call `/v1/chat/completions` and `/v1/models` |
+| `serve` | Connect a browser tab as a worker and answer other people's requests |
+| `admin` | Manage keys, read the audit log, change mesh settings |
+
+Each key can also carry a **daily** and **per-minute** request limit (0 means
+unlimited) and an **allowlist** of models it may use. A mesh-wide block list
+overrides every key's allowlist.
+
+A key's plaintext is shown once, at creation, and never again — only its
+SHA-256 is stored. Revoking takes effect on the next request; the console
+refuses to revoke the last admin key, because locking every administrator out
+of a box on a shelf is not recoverable.
+
+### What the audit log records
+
+By default, every request produces an entry naming the key, the model, the
+worker that served it, the outcome and the duration — plus a **SHA-256 of the
+prompt and its character count, not the prompt itself**. That is enough to
+prove a request happened, to show two requests were identical, or to match a
+prompt if one is ever disclosed, without the log becoming the leak it exists to
+guard against. Administrative changes are recorded too, so a key cannot be
+granted quietly.
+
+```bash
+MESH_AUDIT_RETENTION=hashed   # default: hash + length
+MESH_AUDIT_RETENTION=none     # record who and what, nothing about content
+MESH_AUDIT_RETENTION=full     # store prompt and completion text verbatim
+```
+
+`full` is opt-in, announced at startup, flagged in the console, and stamped
+into every entry it produces. Entries are newline-delimited JSON at
+`coordinator/data/audit.jsonl`, rotated at 32 MB, ready to ship to whatever
+your organisation already uses.
+
 ### Coordinator configuration
 
 | Variable | Default | |
@@ -173,6 +228,9 @@ needs no key and is there for uptime checks.
 | `MESH_MAX_QUEUE` | `64` | Waiting requests before returning 429 |
 | `MESH_MDNS` | on | Set `off` to skip the `_meshgpu._tcp` advertisement |
 | `MESH_NAME` | `MeshGPU (hostname)` | Name shown in mDNS browsers |
+| `MESH_TOKEN` | *generated* | Adopted as a full-scope admin key; pin it to keep links stable |
+| `MESH_DATA_DIR` | `coordinator/data` | Where keys, quotas and the audit log live |
+| `MESH_AUDIT_RETENTION` | `hashed` | `hashed`, `none`, or `full` |
 
 ### Just inspecting your GPU?
 
@@ -270,16 +328,19 @@ elsewhere, but capacity is only as reliable as people's browsing habits. This
 is a real operational difference from a dedicated server and you should plan
 around it rather than hope.
 
-**One shared key, no identity.** Everyone on the mesh — every contributor and
-every client — presents the same token. There is no per-user identity, no
-revocation of one person without rotating for all, and no audit trail of who
-asked what. That is adequate for a trusted office LAN and inadequate for
-anything with a compliance requirement.
+**Identity is a key, not a person.** Each key has a name, scopes, quotas and
+an allowlist, and can be revoked on its own — enough to answer "who ran this"
+and "cut off that laptop". What it is not is single sign-on: there is no IdP
+integration, so a leaver's access ends when someone revokes their key, not when
+their directory account is disabled. For a small team that is a process
+problem; for a large one it is a gap.
 
 **Prompts pass through the coordinator.** In Pool mode the request path is
-client → coordinator → browser tab. Everything stays on the LAN, and nothing is
-written to disk, but the coordinator process does see prompt text in memory.
-The stronger "not even the coordinator sees it" property belongs to the
+client → coordinator → browser tab. Everything stays on the LAN, and by default
+no prompt text is written anywhere — the audit log stores a SHA-256 and a
+character count. But the coordinator process does see prompt text in memory,
+and `MESH_AUDIT_RETENTION=full` will persist it if you explicitly ask. The
+stronger "not even the coordinator sees it" property belongs to the
 peer-to-peer shard path, which does not do real inference yet.
 
 **Shard-mode pairing is unauthenticated.** Anyone who can see or photograph the
@@ -318,10 +379,12 @@ Ordered by what unblocks the most.
 scales with the number of contributors, tolerates a machine disappearing
 mid-request, and needs no tensor streaming.
 
-**Next — make the mesh governable.** Per-user identity instead of one shared
-token, an audit log, per-user quotas, a model allowlist, and a coordinator
-admin view. This is what turns a useful tool into something an organisation can
-actually adopt.
+**Done — the governance layer.** Named keys with scopes, per-key quotas, model
+allowlists, a privacy-preserving audit log, and an admin console.
+
+**Next — SSO and release integrity.** OIDC so identity comes from the
+organisation's directory rather than a key someone pasted into Slack; signed
+releases and an SBOM so what you run is what was published.
 
 **Then — transport hardening.** Frame chunking and an f16 wire format so
 prefill-sized tensors survive the DataChannel; retransmit deadlines so a
@@ -389,11 +452,17 @@ src/
 
 coordinator/
 ├── server.js                # HTTP + WebSocket + mDNS, serves dist/
+├── public/admin.html        # Admin console (self-contained, no CDN)
 ├── lib/
 │   ├── registry.js          # Worker pool: readiness, pausing, least-loaded pick
 │   ├── queue.js             # Job routing, queueing, timeouts, retry-on-loss
 │   ├── openai.js            # Request validation + OpenAI response shapes
-│   └── auth.js              # Shared-token check (constant time)
+│   ├── identity.js          # Named API keys, scopes, revocation
+│   ├── quota.js             # Per-key daily and per-minute limits
+│   ├── audit.js             # Append-only log, hashed prompts by default
+│   ├── admin.js             # Admin API: keys, audit, settings
+│   ├── store.js             # Atomic JSON persistence — no database to install
+│   └── http.js              # Shared request/response helpers
 └── test/                    # Unit + full HTTP/WebSocket integration tests
 ```
 

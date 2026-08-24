@@ -8,6 +8,9 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import WebSocket from 'ws';
 
 const PORT = 8123;
@@ -16,6 +19,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const MODEL = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
 
 let server;
+let dataDir;
 
 /** A browser tab, minus the browser. */
 class FakeWorker {
@@ -106,10 +110,13 @@ async function readStream(response) {
 }
 
 beforeAll(async () => {
+  // Keep key and audit state out of the repository.
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meshgpu-it-'));
   process.env.MESH_PORT = String(PORT);
   process.env.MESH_TOKEN = TOKEN;
   process.env.MESH_MDNS = 'off';
   process.env.MESH_JOB_TIMEOUT_MS = '5000';
+  process.env.MESH_DATA_DIR = dataDir;
 
   ({ server } = await import('../server.js'));
   if (!server.listening) {
@@ -119,6 +126,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise((resolve) => server.close(resolve));
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe('coordinator HTTP surface', () => {

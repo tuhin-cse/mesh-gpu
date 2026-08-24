@@ -31,3 +31,6 @@ yarn-error.log*
 # Env
 .env
 .env.*
+
+# Coordinator runtime state (API keys, quota counters, audit log)
+coordinator/data/

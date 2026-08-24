@@ -11,7 +11,8 @@
  *
  * What it does NOT do: run models, see GPU memory, or talk to the internet.
  * Prompts and completions pass through it on their way between an LAN client
- * and an LAN browser tab, and are never persisted.
+ * and an LAN browser tab. By default nothing of their content is persisted —
+ * the audit log records a hash and a length, not the text.
  */
 
 import fs from 'node:fs';
@@ -23,7 +24,13 @@ import { WebSocketServer } from 'ws';
 
 import { WorkerRegistry } from './lib/registry.js';
 import { JobQueue } from './lib/queue.js';
-import { bearerFrom, resolveToken, tokenMatches } from './lib/auth.js';
+import { resolveToken } from './lib/auth.js';
+import { bearerFrom, readBody, sendJson } from './lib/http.js';
+import { Store } from './lib/store.js';
+import { Identity, SCOPES, hasScope, mayUseModel } from './lib/identity.js';
+import { Quota } from './lib/quota.js';
+import { AuditLog, RETENTION } from './lib/audit.js';
+import { handleAdminApi } from './lib/admin.js';
 import {
   completionBody,
   errorBody,
@@ -42,7 +49,37 @@ const JOB_TIMEOUT_MS = Number(process.env.MESH_JOB_TIMEOUT_MS ?? 120_000);
 const MAX_QUEUE_DEPTH = Number(process.env.MESH_MAX_QUEUE ?? 64);
 const HEARTBEAT_MS = 15_000;
 
-const { token: TOKEN, generated: TOKEN_GENERATED } = resolveToken(process.env.MESH_TOKEN);
+const DATA_DIR = process.env.MESH_DATA_DIR ?? path.resolve(HERE, 'data');
+const STATE_FILE = process.env.MESH_STATE_FILE ?? path.join(DATA_DIR, 'state.json');
+const AUDIT_FILE = process.env.MESH_AUDIT_FILE ?? path.join(DATA_DIR, 'audit.jsonl');
+const AUDIT_RETENTION = process.env.MESH_AUDIT_RETENTION ?? RETENTION.HASHED;
+
+const store = new Store(STATE_FILE);
+const identity = new Identity(store);
+const quota = new Quota(store);
+const audit = new AuditLog({ filePath: AUDIT_FILE, retention: AUDIT_RETENTION });
+
+/**
+ * Bootstrap an administrator.
+ *
+ * MESH_TOKEN, when set, is adopted as a full-scope key so existing setups keep
+ * working. Otherwise, on a mesh with no admin key at all, one is generated and
+ * printed — a coordinator that starts with no way in is useless, and one that
+ * starts wide open is worse.
+ */
+const { token: BOOTSTRAP_TOKEN, generated: TOKEN_GENERATED } = resolveToken(process.env.MESH_TOKEN);
+let bootstrapKey = null;
+if (process.env.MESH_TOKEN) {
+  identity.adopt(BOOTSTRAP_TOKEN, 'MESH_TOKEN');
+  bootstrapKey = BOOTSTRAP_TOKEN;
+} else if (!identity.hasAdmin()) {
+  identity.adopt(BOOTSTRAP_TOKEN, 'bootstrap admin');
+  bootstrapKey = BOOTSTRAP_TOKEN;
+}
+store.flush();
+
+// Usage rows accumulate one per key per day; trim on startup.
+quota.prunePastDays(32);
 
 const registry = new WorkerRegistry();
 const queue = new JobQueue({
@@ -93,41 +130,6 @@ function serveStatic(req, res) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function sendJson(res, status, body) {
-  const text = JSON.stringify(body);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
-  });
-  res.end(text);
-}
-
-function readBody(req, limitBytes = 4 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > limitBytes) {
-        reject(Object.assign(new Error('request body too large'), { status: 413 }));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8');
-      if (raw.length === 0) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        reject(Object.assign(new Error('request body is not valid JSON'), { status: 400 }));
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
 /** CORS so a page served from `npm run dev` can talk to a coordinator on :8080. */
 function applyCors(res) {
   res.setHeader('access-control-allow-origin', '*');
@@ -139,12 +141,65 @@ function applyCors(res) {
 // Chat completions
 // ---------------------------------------------------------------------------
 
-async function handleChatCompletions(req, res) {
+async function handleChatCompletions(req, res, principal) {
   const body = await readBody(req);
   const { model, messages, stream, params } = parseChatRequest(body);
 
+  const startedAt = Date.now();
+  // Prompt text is handed to the audit log, which decides what — if anything —
+  // of it is retained. By default that is a hash and a length.
+  const promptText = messages.map((message) => `${message.role}: ${message.content}`).join('\n');
+
+  // errorBody(message, type, code) — the second argument is the category, the
+  // third the specific reason. Client SDKs branch on `code`.
+  const deny = (status, message, type, code, extraHeaders = {}) => {
+    audit.record({
+      type: 'chat.completion',
+      keyId: principal.id,
+      keyName: principal.name,
+      model,
+      outcome: 'denied',
+      prompt: promptText,
+      detail: { reason: message },
+    });
+    sendJson(res, status, errorBody(message, type, code), extraHeaders);
+  };
+
+  if (!mayUseModel(principal, model, store.state.settings.blockedModels)) {
+    return deny(
+      403,
+      `this key is not permitted to use "${model}"`,
+      'permission_error',
+      'model_not_allowed',
+    );
+  }
+
+  const allowance = quota.check(principal);
+  if (!allowance.ok) {
+    return deny(429, allowance.reason, 'rate_limit_error', 'rate_limit_exceeded', {
+      'retry-after': String(allowance.retryAfterSeconds),
+    });
+  }
+  quota.consume(principal);
+  identity.markUsed(principal.id);
+
   const id = newId('chatcmpl');
   const created = Math.floor(Date.now() / 1000);
+
+  const finish = (outcome, completion, workerId, detail) => {
+    audit.record({
+      type: 'chat.completion',
+      keyId: principal.id,
+      keyName: principal.name,
+      model,
+      workerId: workerId ?? null,
+      outcome,
+      durationMs: Date.now() - startedAt,
+      prompt: promptText,
+      completion,
+      detail,
+    });
+  };
 
   if (stream) {
     res.writeHead(200, {
@@ -155,26 +210,28 @@ async function handleChatCompletions(req, res) {
     });
 
     const write = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    // An empty leading delta gives the client its role immediately, matching
-    // OpenAI's stream shape.
     write(streamChunk(id, model, null, created));
 
+    let text = '';
     const job = queue.submit({
       id: newId('job'),
       model,
       payload: { messages, ...params },
-      onChunk: (delta) => write(streamChunk(id, model, delta, created)),
-      onDone: () => {
+      onChunk: (delta) => {
+        text += delta;
+        write(streamChunk(id, model, delta, created));
+      },
+      onDone: (info) => {
         write(streamDone(id, model, created));
         res.write('data: [DONE]\n\n');
         res.end();
+        finish('ok', text, info.workerId);
       },
       onError: (error) => {
-        // Mid-stream there is no status code left to set, so the error is
-        // delivered in-band; clients surface it as a truncated completion.
         write({ ...streamDone(id, model, created, 'error'), error: { message: error.message } });
         res.write('data: [DONE]\n\n');
         res.end();
+        finish('error', text, null, { reason: error.message });
       },
     });
 
@@ -183,21 +240,39 @@ async function handleChatCompletions(req, res) {
   }
 
   let text = '';
-  await new Promise((resolve, reject) => {
-    const job = queue.submit({
-      id: newId('job'),
-      model,
-      payload: { messages, ...params },
-      onChunk: (delta) => {
-        text += delta;
-      },
-      onDone: () => resolve(undefined),
-      onError: reject,
+  let servedBy = null;
+  try {
+    await new Promise((resolve, reject) => {
+      const job = queue.submit({
+        id: newId('job'),
+        model,
+        payload: { messages, ...params },
+        onChunk: (delta) => {
+          text += delta;
+        },
+        onDone: (info) => {
+          servedBy = info.workerId;
+          resolve(undefined);
+        },
+        onError: reject,
+      });
+      res.on('close', () => queue.cancel(job.id));
     });
-    res.on('close', () => queue.cancel(job.id));
-  });
+  } catch (error) {
+    finish('error', text, null, { reason: error.message });
+    throw error;
+  }
 
+  finish('ok', text, servedBy);
   sendJson(res, 200, completionBody(id, model, text, created));
+}
+
+/**
+ * Resolve the caller. Returns the key record, or null — callers must not
+ * distinguish "unknown key" from "revoked key" in what they send back.
+ */
+function authenticate(req) {
+  return identity.verify(bearerFrom(req));
 }
 
 // ---------------------------------------------------------------------------
@@ -214,18 +289,45 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  // Unauthenticated: liveness only. Everything under /v1 needs the token.
+  // Unauthenticated: liveness, and the admin page shell. The console is inert
+  // HTML — every byte of data it shows comes from an authenticated fetch.
   if (route === '/healthz') {
     return sendJson(res, 200, { ok: true, workers: registry.size, ...queue.stats });
   }
+  if (route === '/admin' || route === '/admin/') {
+    return serveFile(res, path.join(HERE, 'public', 'admin.html'), 'text/html; charset=utf-8');
+  }
 
-  if (route.startsWith('/v1/') || route === '/status') {
-    if (!tokenMatches(bearerFrom(req), TOKEN)) {
+  const needsAuth = route.startsWith('/v1/') || route.startsWith('/admin/') || route === '/status';
+  let principal = null;
+  if (needsAuth) {
+    principal = authenticate(req);
+    if (!principal) {
       return sendJson(res, 401, errorBody('missing or invalid API key', 'authentication_error'));
     }
   }
 
+  if (route.startsWith('/admin/')) {
+    if (!hasScope(principal, SCOPES.ADMIN)) {
+      return sendJson(res, 403, errorBody('this key lacks the admin scope', 'permission_error'));
+    }
+    return handleAdminApi(
+      { identity, quota, audit, store, registry, queue, principal },
+      req,
+      res,
+      url,
+    ).then((handled) => {
+      if (!handled) sendJson(res, 404, errorBody(`no route for ${route}`));
+    }).catch((error) => {
+      if (res.headersSent) return res.end();
+      sendJson(res, error.status ?? 500, errorBody(error.message, error.code ?? 'server_error'));
+    });
+  }
+
   if (route === '/status') {
+    if (!hasScope(principal, SCOPES.ADMIN)) {
+      return sendJson(res, 403, errorBody('this key lacks the admin scope', 'permission_error'));
+    }
     return sendJson(res, 200, {
       workers: registry.snapshot(),
       models: registry.availableModels(),
@@ -233,10 +335,18 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  if (route.startsWith('/v1/') && !hasScope(principal, SCOPES.CHAT)) {
+    return sendJson(res, 403, errorBody('this key lacks the chat scope', 'permission_error'));
+  }
+
   if (route === '/v1/models') {
+    // Only advertise what this key could actually call.
+    const usable = registry
+      .availableModels()
+      .filter((model) => mayUseModel(principal, model, store.state.settings.blockedModels));
     return sendJson(res, 200, {
       object: 'list',
-      data: registry.availableModels().map((id) => ({
+      data: usable.map((id) => ({
         id,
         object: 'model',
         owned_by: 'meshgpu',
@@ -249,7 +359,7 @@ const server = http.createServer((req, res) => {
     if (req.method !== 'POST') {
       return sendJson(res, 405, errorBody('use POST', 'invalid_request_error'));
     }
-    return handleChatCompletions(req, res).catch((error) => {
+    return handleChatCompletions(req, res, principal).catch((error) => {
       if (res.headersSent) return res.end();
       const status = error.status ?? 500;
       sendJson(res, status, errorBody(error.message, error.code ?? 'server_error'));
@@ -260,6 +370,15 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, errorBody(`no route for ${route}`, 'invalid_request_error'));
 });
 
+/** Send a single file, used for the admin console shell. */
+function serveFile(res, filePath, contentType) {
+  if (!fs.existsSync(filePath)) {
+    return sendJson(res, 404, errorBody('admin console not installed', 'server_error'));
+  }
+  res.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-cache' });
+  fs.createReadStream(filePath).pipe(res);
+}
+
 // ---------------------------------------------------------------------------
 // Worker WebSocket
 // ---------------------------------------------------------------------------
@@ -268,15 +387,23 @@ const wss = new WebSocketServer({ server, path: '/mesh' });
 
 wss.on('connection', (socket, req) => {
   const url = new URL(req.url ?? '/mesh', 'http://localhost');
-  // Browsers cannot set headers on a WebSocket handshake, so the token comes
-  // in the query string. It never leaves the LAN and is not logged.
-  if (!tokenMatches(url.searchParams.get('token'), TOKEN)) {
-    socket.close(4401, 'invalid token');
+  // Browsers cannot set headers on a WebSocket handshake, so the key comes in
+  // the query string. It never leaves the LAN and is never written to the log.
+  const principal = identity.verify(url.searchParams.get('token'));
+  if (!principal) {
+    socket.close(4401, 'invalid key');
+    return;
+  }
+  if (!hasScope(principal, SCOPES.SERVE)) {
+    // A key that may ask the mesh questions is not automatically a key that
+    // may answer them for other people.
+    socket.close(4403, 'this key lacks the serve scope');
     return;
   }
 
   const workerId = newId('worker');
   const label = (url.searchParams.get('label') ?? 'browser').slice(0, 60);
+  identity.markUsed(principal.id);
 
   registry.register({
     id: workerId,
@@ -293,7 +420,14 @@ wss.on('connection', (socket, req) => {
   });
 
   socket.send(JSON.stringify({ type: 'welcome', workerId, heartbeatMs: HEARTBEAT_MS }));
-  log(`worker joined: ${label} (${workerId}) — ${registry.size} on the mesh`);
+  log(`worker joined: ${label} [${principal.name}] — ${registry.size} on the mesh`);
+  audit.record({
+    type: 'worker.joined',
+    keyId: principal.id,
+    keyName: principal.name,
+    workerId,
+    detail: { label },
+  });
 
   socket.on('message', (raw) => {
     let message;
@@ -330,6 +464,13 @@ wss.on('connection', (socket, req) => {
     if (registry.remove(workerId)) {
       queue.releaseWorker(workerId);
       log(`worker left: ${label} (${reason}) — ${registry.size} on the mesh`);
+      audit.record({
+        type: 'worker.left',
+        keyId: principal.id,
+        keyName: principal.name,
+        workerId,
+        detail: { reason },
+      });
     }
   };
 
@@ -405,10 +546,20 @@ server.listen(PORT, HOST, async () => {
   console.log('');
   log(`coordinator listening on http://${primary}:${PORT}`);
   log(`OpenAI endpoint:  http://${primary}:${PORT}/v1`);
-  log(`API key:          ${TOKEN}${TOKEN_GENERATED ? '  (generated — set MESH_TOKEN to pin it)' : ''}`);
+  log(`Admin console:    http://${primary}:${PORT}/admin`);
+  log(`Audit retention:  ${audit.retention}${audit.retention === RETENTION.FULL ? '  *** PROMPT TEXT IS BEING STORED ***' : ' (prompt text is not stored)'}`);
+  log(`State file:       ${STATE_FILE}`);
   console.log('');
-  log('Share this link with colleagues to lend their GPU:');
-  log(`  http://${primary}:${PORT}/?token=${TOKEN}`);
+  if (bootstrapKey) {
+    log(`Admin key:        ${bootstrapKey}${TOKEN_GENERATED ? '  (generated — set MESH_TOKEN to pin it)' : ''}`);
+    console.log('');
+    log('Share this link with colleagues to lend their GPU:');
+    log(`  http://${primary}:${PORT}/?token=${bootstrapKey}`);
+    log('Better: issue each person their own key in the admin console, so you');
+    log('can see who used what and revoke one without rotating for everyone.');
+  } else {
+    log('Admin keys already exist — issue worker keys from the admin console.');
+  }
   if (addresses.length > 1) {
     log(`Other addresses: ${addresses.slice(1).join(', ')}`);
   }
@@ -421,6 +572,7 @@ server.listen(PORT, HOST, async () => {
 function shutdown() {
   log('shutting down');
   clearInterval(heartbeat);
+  store.close(); // flush any pending quota/key writes
   advertisement?.service?.stop?.();
   advertisement?.bonjour?.destroy?.();
   for (const socket of wss.clients) socket.close(1001, 'coordinator shutting down');
@@ -431,4 +583,4 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-export { server, registry, queue };
+export { server, registry, queue, identity, quota, audit, store };

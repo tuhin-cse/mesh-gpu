@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshGPU — Admin</title>
+<style>
+  :root {
+    --bg: #09090b; --panel: #18181b; --panel-2: #101012; --line: #27272a;
+    --text: #e4e4e7; --dim: #a1a1aa; --faint: #71717a;
+    --accent: #34d399; --accent-dim: #065f46;
+    --warn: #fbbf24; --danger: #f87171; --info: #60a5fa;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--faint); font-size: 12.5px; }
+  .spacer { margin-left: auto; }
+
+  button {
+    font: inherit; font-size: 13px; cursor: pointer; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    padding: 7px 13px; transition: background .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: #232327; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #059669; border-color: #059669; color: #fff; font-weight: 500; }
+  button.primary:hover:not(:disabled) { background: #10b981; }
+  button.danger { color: var(--danger); border-color: #7f1d1d; }
+  button.danger:hover:not(:disabled) { background: #2a1111; }
+  button.tiny { padding: 4px 9px; font-size: 12px; }
+
+  input, select {
+    font: inherit; font-size: 13px; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; width: 100%;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent-dim); }
+  label { display: block; font-size: 11.5px; color: var(--faint); margin-bottom: 4px;
+          text-transform: uppercase; letter-spacing: .06em; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 11px;
+           padding: 18px; margin-bottom: 18px; }
+  .panel h2 { font-size: 13px; font-weight: 600; margin: 0 0 14px; color: var(--dim);
+              text-transform: uppercase; letter-spacing: .07em; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; }
+  .stat .label { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+  .stat .value { font-size: 21px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--faint); font-weight: 600; padding: 0 12px 9px 0; border-bottom: 1px solid var(--line); }
+  td { padding: 10px 12px 10px 0; border-bottom: 1px solid #1c1c1f; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .scroll { overflow-x: auto; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+          font-weight: 500; border: 1px solid transparent; white-space: nowrap; }
+  .pill.ok      { background: rgba(52,211,153,.12); color: var(--accent); border-color: rgba(52,211,153,.3); }
+  .pill.warn    { background: rgba(251,191,36,.12); color: var(--warn);   border-color: rgba(251,191,36,.3); }
+  .pill.danger  { background: rgba(248,113,113,.12); color: var(--danger); border-color: rgba(248,113,113,.3); }
+  .pill.neutral { background: #202024; color: var(--dim); border-color: var(--line); }
+  .pill + .pill { margin-left: 4px; }
+
+  .row { display: grid; gap: 12px; align-items: end; }
+  .row.create { grid-template-columns: 1.6fr 1.4fr 1fr 1fr auto; }
+  @media (max-width: 860px) { .row.create { grid-template-columns: 1fr 1fr; } }
+
+  .scopes { display: flex; gap: 12px; padding: 7px 0; }
+  .scopes label { display: flex; align-items: center; gap: 5px; margin: 0;
+                  text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text); }
+  .scopes input { width: auto; }
+
+  .banner { border-radius: 9px; padding: 12px 15px; margin-bottom: 16px; font-size: 13px; }
+  .banner.reveal { background: rgba(52,211,153,.08); border: 1px solid var(--accent-dim); }
+  .banner.alert  { background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.35); color: #fde68a; }
+  .banner.error  { background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.35); color: #fecaca; }
+  .reveal code { display: block; margin-top: 7px; padding: 9px 11px; background: #05140f;
+                 border-radius: 6px; font-family: var(--mono); font-size: 13px; word-break: break-all; color: var(--accent); }
+
+  .gate { max-width: 380px; margin: 14vh auto; }
+  .empty { color: var(--faint); font-size: 13px; padding: 18px 0; text-align: center; }
+  .filters { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .filters select, .filters input { width: auto; min-width: 130px; }
+  .hidden { display: none !important; }
+  .outcome-denied { color: var(--warn); }
+  .outcome-error  { color: var(--danger); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ sign in ============ -->
+  <div id="gate" class="gate">
+    <div class="panel">
+      <h1 style="margin-bottom:6px">Mesh<span>GPU</span> Admin</h1>
+      <p class="sub" style="margin:0 0 16px">Paste an admin key. It is kept for this tab only.</p>
+      <label for="gate-key">Admin key</label>
+      <input id="gate-key" type="password" placeholder="mesh_…" autocomplete="off">
+      <div id="gate-error" class="banner error hidden" style="margin-top:12px"></div>
+      <button class="primary" id="gate-go" style="width:100%;margin-top:12px">Sign in</button>
+    </div>
+  </div>
+
+  <!-- ============ console ============ -->
+  <div id="app" class="hidden">
+    <header>
+      <h1>Mesh<span>GPU</span> Admin</h1>
+      <span class="sub" id="retention-note"></span>
+      <span class="spacer"></span>
+      <button class="tiny" id="refresh">Refresh</button>
+      <button class="tiny" id="signout">Sign out</button>
+    </header>
+
+    <div id="alerts"></div>
+
+    <div class="panel">
+      <h2>Mesh</h2>
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Workers</h2>
+      <div class="scroll"><table id="workers"></table></div>
+    </div>
+
+    <div class="panel">
+      <h2>API keys</h2>
+      <div id="new-key" class="banner reveal hidden"></div>
+      <div class="row create">
+        <div><label for="k-name">Name</label><input id="k-name" placeholder="Alice's laptop"></div>
+        <div><label>Scopes</label>
+          <div class="scopes">
+            <label><input type="checkbox" id="s-chat" checked> chat</label>
+            <label><input type="checkbox" id="s-serve"> serve</label>
+            <label><input type="checkbox" id="s-admin"> admin</label>
+          </div>
+        </div>
+        <div><label for="k-daily">Per day</label><input id="k-daily" type="number" min="0" value="0"></div>
+        <div><label for="k-minute">Per minute</label><input id="k-minute" type="number" min="0" value="0"></div>
+        <div><button class="primary" id="k-create">Issue key</button></div>
+      </div>
+      <p class="sub" style="margin:10px 0 16px">0 means unlimited. A key is shown once, at creation.</p>
+      <div class="scroll"><table id="keys"></table></div>
+    </div>
+
+    <div class="panel">
+      <h2>Audit log</h2>
+      <div class="filters">
+        <select id="f-type">
+          <option value="">All events</option>
+          <option value="chat.completion">Completions</option>
+          <option value="worker.joined">Worker joined</option>
+          <option value="worker.left">Worker left</option>
+          <option value="key.created">Key created</option>
+          <option value="key.revoked">Key revoked</option>
+          <option value="settings.updated">Settings changed</option>
+        </select>
+        <select id="f-outcome">
+          <option value="">Any outcome</option>
+          <option value="ok">ok</option>
+          <option value="denied">denied</option>
+          <option value="error">error</option>
+        </select>
+        <input id="f-key" placeholder="Key id (optional)">
+      </div>
+      <div class="scroll"><table id="audit"></table></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const STORAGE = 'meshgpu.adminKey';
+  let key = sessionStorage.getItem(STORAGE) || '';
+  let timer = null;
+
+  /** Escape before any interpolation — audit entries contain user-controlled text. */
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      ...options,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...(options.headers || {}) },
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body?.error?.message || `request failed (${res.status})`);
+    return body;
+  }
+
+  // ---------- sign in ----------
+  async function signIn(candidate) {
+    key = candidate;
+    await api('/admin/api/overview');           // fails here if the key is wrong
+    sessionStorage.setItem(STORAGE, key);
+    $('gate').classList.add('hidden');
+    $('app').classList.remove('hidden');
+    await refresh();
+    timer = setInterval(refresh, 5000);
+  }
+
+  $('gate-go').onclick = async () => {
+    const candidate = $('gate-key').value.trim();
+    if (!candidate) return;
+    try {
+      $('gate-error').classList.add('hidden');
+      await signIn(candidate);
+    } catch (err) {
+      $('gate-error').textContent = err.message;
+      $('gate-error').classList.remove('hidden');
+    }
+  };
+  $('gate-key').onkeydown = (e) => { if (e.key === 'Enter') $('gate-go').click(); };
+
+  $('signout').onclick = () => {
+    sessionStorage.removeItem(STORAGE);
+    clearInterval(timer);
+    location.reload();
+  };
+  $('refresh').onclick = () => refresh();
+
+  // ---------- rendering ----------
+  function renderStats(o) {
+    const total = Object.values(o.usage || {}).reduce((a, b) => a + b, 0);
+    const serving = o.workers.filter((w) => w.inFlight > 0).length;
+    const cells = [
+      ['Workers', o.workers.length],
+      ['Serving now', serving],
+      ['Models', o.models.length],
+      ['Queued', o.queue.waiting],
+      ['Active keys', o.keys],
+      ['Requests (7d)', total],
+    ];
+    $('stats').innerHTML = cells
+      .map(([label, value]) => `<div class="stat"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`)
+      .join('');
+  }
+
+  function renderWorkers(workers) {
+    if (!workers.length) {
+      $('workers').innerHTML = '<tr><td class="empty">No one is contributing yet. Send someone the join link.</td></tr>';
+      return;
+    }
+    $('workers').innerHTML =
+      '<thead><tr><th>Name</th><th>Model</th><th>State</th><th>In flight</th><th>Served</th></tr></thead><tbody>' +
+      workers.map((w) => {
+        const state = w.paused
+          ? '<span class="pill warn">paused</span>'
+          : w.inFlight > 0 ? '<span class="pill ok">serving</span>' : '<span class="pill neutral">idle</span>';
+        return `<tr><td>${esc(w.label)}</td><td class="mono">${esc(w.model || '—')}</td>` +
+               `<td>${state}</td><td>${esc(w.inFlight)} / ${esc(w.maxConcurrent)}</td><td>${esc(w.completed)}</td></tr>`;
+      }).join('') + '</tbody>';
+  }
+
+  function renderKeys(keys, usage) {
+    if (!keys.length) {
+      $('keys').innerHTML = '<tr><td class="empty">No keys yet.</td></tr>';
+      return;
+    }
+    $('keys').innerHTML =
+      '<thead><tr><th>Name</th><th>Id</th><th>Scopes</th><th>Limits</th><th>Used (7d)</th><th>Last used</th><th></th></tr></thead><tbody>' +
+      keys.map((k) => {
+        const scopes = k.scopes.map((s) => `<span class="pill ${s === 'admin' ? 'danger' : 'neutral'}">${esc(s)}</span>`).join('');
+        const limits = [
+          k.dailyRequestLimit ? `${k.dailyRequestLimit}/day` : null,
+          k.requestsPerMinute ? `${k.requestsPerMinute}/min` : null,
+        ].filter(Boolean).join(' · ') || '<span class="sub">unlimited</span>';
+        const models = k.allowedModels ? `<div class="sub mono">${esc(k.allowedModels.join(', '))}</div>` : '';
+        const last = k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : '<span class="sub">never</span>';
+        return `<tr><td>${esc(k.name)}${models}</td><td class="mono">${esc(k.id)}</td><td>${scopes}</td>` +
+               `<td class="mono">${limits}</td><td>${esc(usage[k.id] || 0)}</td><td class="sub">${last}</td>` +
+               `<td><button class="tiny danger" data-revoke="${esc(k.id)}">Revoke</button></td></tr>`;
+      }).join('') + '</tbody>';
+
+    $('keys').querySelectorAll('[data-revoke]').forEach((button) => {
+      button.onclick = async () => {
+        const id = button.dataset.revoke;
+        if (!confirm(`Revoke key ${id}? Anything using it stops working immediately.`)) return;
+        try {
+          await api(`/admin/api/keys/${id}`, { method: 'DELETE' });
+          await refresh();
+        } catch (err) { alert(err.message); }
+      };
+    });
+  }
+
+  function renderAudit(entries, retention) {
+    if (!entries.length) {
+      $('audit').innerHTML = '<tr><td class="empty">Nothing recorded yet.</td></tr>';
+      return;
+    }
+    const contentHeader = retention === 'full' ? 'Prompt' : retention === 'none' ? '' : 'Prompt hash';
+    $('audit').innerHTML =
+      `<thead><tr><th>Time</th><th>Event</th><th>Key</th><th>Model</th><th>Outcome</th><th>${esc(contentHeader)}</th></tr></thead><tbody>` +
+      entries.map((e) => {
+        let content = '';
+        if (retention === 'full' && e.promptText) content = esc(e.promptText.slice(0, 90));
+        else if (e.promptHash) content = `${esc(e.promptHash.slice(0, 16))}… <span class="sub">${esc(e.promptChars)} ch</span>`;
+        else if (e.detail?.reason) content = `<span class="sub">${esc(e.detail.reason)}</span>`;
+        const cls = e.outcome === 'ok' ? '' : `outcome-${esc(e.outcome)}`;
+        return `<tr><td class="sub mono">${esc(new Date(e.ts).toLocaleTimeString())}</td>` +
+               `<td class="mono">${esc(e.type)}</td><td>${esc(e.keyName || '—')}</td>` +
+               `<td class="mono">${esc(e.model || '—')}</td><td class="${cls}">${esc(e.outcome)}</td>` +
+               `<td class="mono">${content}</td></tr>`;
+      }).join('') + '</tbody>';
+  }
+
+  function renderAlerts(o) {
+    const alerts = [];
+    if (o.retention === 'full') {
+      alerts.push('<div class="banner alert"><strong>Prompt text is being stored.</strong> ' +
+        'Every prompt and completion is written to the audit log in full. Unset <code>MESH_AUDIT_RETENTION=full</code> to go back to hashes.</div>');
+    }
+    if (o.auditWriteError) {
+      alerts.push(`<div class="banner error"><strong>The audit log is not being written.</strong> Last failure ${esc(o.auditWriteError)}. Requests are still being served, but they are not being recorded.</div>`);
+    }
+    $('alerts').innerHTML = alerts.join('');
+    $('retention-note').textContent =
+      o.retention === 'full' ? 'audit: full prompt text'
+      : o.retention === 'none' ? 'audit: no content recorded'
+      : 'audit: prompt hashes only';
+  }
+
+  // ---------- create ----------
+  $('k-create').onclick = async () => {
+    const scopes = [];
+    if ($('s-chat').checked) scopes.push('chat');
+    if ($('s-serve').checked) scopes.push('serve');
+    if ($('s-admin').checked) scopes.push('admin');
+
+    try {
+      const body = await api('/admin/api/keys', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: $('k-name').value,
+          scopes,
+          dailyRequestLimit: Number($('k-daily').value) || 0,
+          requestsPerMinute: Number($('k-minute').value) || 0,
+        }),
+      });
+      const joinLink = `${location.origin}/?token=${encodeURIComponent(body.key)}`;
+      $('new-key').innerHTML =
+        `<strong>Key for ${esc(body.record.name)} — copy it now, it is not shown again.</strong>` +
+        `<code>${esc(body.key)}</code>` +
+        (body.record.scopes.includes('serve')
+          ? `<div class="sub" style="margin-top:9px">Join link for contributing a GPU:</div><code>${esc(joinLink)}</code>`
+          : '');
+      $('new-key').classList.remove('hidden');
+      $('k-name').value = '';
+      await refresh();
+    } catch (err) { alert(err.message); }
+  };
+
+  ['f-type', 'f-outcome'].forEach((id) => { $(id).onchange = () => refresh(); });
+  $('f-key').oninput = () => { clearTimeout($('f-key')._t); $('f-key')._t = setTimeout(refresh, 300); };
+
+  // ---------- refresh ----------
+  async function refresh() {
+    try {
+      const params = new URLSearchParams({ limit: '80' });
+      if ($('f-type').value) params.set('type', $('f-type').value);
+      if ($('f-outcome').value) params.set('outcome', $('f-outcome').value);
+      if ($('f-key').value.trim()) params.set('keyId', $('f-key').value.trim());
+
+      const [overview, keys, auditLog] = await Promise.all([
+        api('/admin/api/overview'),
+        api('/admin/api/keys'),
+        api(`/admin/api/audit?${params}`),
+      ]);
+
+      renderAlerts(overview);
+      renderStats(overview);
+      renderWorkers(overview.workers);
+      renderKeys(keys.keys, overview.usage);
+      renderAudit(auditLog.entries, auditLog.retention);
+    } catch (err) {
+      if (/invalid API key|admin scope/i.test(err.message)) {
+        sessionStorage.removeItem(STORAGE);
+        clearInterval(timer);
+        location.reload();
+      }
+    }
+  }
+
+  if (key) signIn(key).catch(() => sessionStorage.removeItem(STORAGE));
+})();
+</script>
+</body>
+</html>
