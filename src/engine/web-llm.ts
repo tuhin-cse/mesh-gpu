@@ -153,7 +153,10 @@ export class WebLLMRuntime {
   private async disposeEngine(): Promise<void> {
     if (!this.engine) return;
     try {
-      await this.engine.resetChat();
+      // `unload()` releases the GPU buffers holding the weights. `resetChat()`
+      // only clears conversation state, so relying on it leaks the whole model
+      // every time the user switches to a different one.
+      await this.engine.unload();
     } catch {
       // Best-effort teardown — the engine is dropped regardless.
     }

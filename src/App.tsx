@@ -80,8 +80,8 @@ export default function App() {
               Mesh<span className="text-emerald-400">GPU</span>
             </h1>
             <p className="mt-1 max-w-xl text-sm text-zinc-400">
-              Browser-native P2P model inference — pool VRAM across tabs with WebGPU + WebRTC
-              pipeline sharding.
+              Browser-native GPU mesh — WebGPU capability probing, serverless WebRTC pairing and
+              a peer-to-peer tensor transport. Sharded inference is not implemented yet.
             </p>
             <span className="mt-3 inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300">
               100% Air-Gapped &amp; Offline — No Server Data Traversal
@@ -405,7 +405,7 @@ function PipelineCard({
   const [peerInfo, setPeerInfo] = useState<PeerInfo[]>([]);
   const [ownStage, setOwnStage] = useState<{ start: number; end: number } | null>(null);
   const [latencies, setLatencies] = useState<Record<string, number | null>>({});
-  const [tokPerSec, setTokPerSec] = useState(0);
+  const [loopbackFps, setLoopbackFps] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
   const tokensRef = useRef<number[]>([]);
 
@@ -423,7 +423,7 @@ function PipelineCard({
     setPeerInfo([]);
     setOwnStage(null);
     setLatencies({});
-    setTokPerSec(0);
+    setLoopbackFps(0);
     tokensRef.current = [];
   }, []);
 
@@ -456,14 +456,14 @@ function PipelineCard({
               stage ? `auto-assigned stage: [${stage.start}, ${stage.end})` : 'stage cleared',
             );
           },
-          onToken: (token, meta) => {
+          onToken: (_token, meta) => {
             const now = performance.now();
             const stamps = tokensRef.current;
             stamps.push(now);
             const cutoff = now - 5000;
             while (stamps.length > 0 && stamps[0] < cutoff) stamps.shift();
-            setTokPerSec(stamps.length / 5);
-            pushLog(`output token ${token} (seq ${meta.seqId}) from ${meta.fromPeerId}`);
+            setLoopbackFps(stamps.length / 5);
+            pushLog(`loopback frame returned (seq ${meta.seqId}) from ${meta.fromPeerId}`);
           },
           onForwarded: (frame) => {
             pushLog(`forwarded tensor → layers [${frame.fromLayer}, ${frame.toLayer})`);
@@ -560,7 +560,7 @@ function PipelineCard({
     const input = new Float32Array(16).map((_, i) => i);
     try {
       const token = await node.run(input, [1, 16]);
-      if (token !== null) pushLog(`local output token: ${token}`);
+      if (token !== null) pushLog(`loopback completed locally (argmax index ${token})`);
     } catch (err) {
       pushLog(`run failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -638,7 +638,13 @@ function PipelineCard({
   }, [ownStage, allocation]);
 
   return (
-    <Card title="P2P Pipeline (WebRTC) — Offline QR Handshake">
+    <Card title="P2P Transport Loopback (WebRTC) — Offline QR Handshake">
+      <p className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed text-amber-200/90">
+        <span className="font-medium">No model runs here yet.</span> This card exercises the
+        handshake, the binary tensor wire format and the layer scheduler using an identity
+        executor — tensors are forwarded between peers unchanged. Sharded inference is on the
+        roadmap; the single-node chat card below is the only place a real model executes.
+      </p>
       <div className="flex flex-wrap items-end gap-4">
         <button
           onClick={() => setShowHandshake(true)}
@@ -660,7 +666,7 @@ function PipelineCard({
           disabled={!canRun}
           className="rounded-lg border border-emerald-700 px-4 py-2 text-sm text-emerald-300 transition hover:bg-emerald-950 disabled:opacity-50"
         >
-          Run identity tensor
+          Run loopback tensor
         </button>
 
         <span className="ml-auto text-xs text-zinc-500">
@@ -680,7 +686,7 @@ function PipelineCard({
           value={ownStage ? `[${ownStage.start}, ${ownStage.end})` : '—'}
         />
         <Stat label="Connected peers" value={peers.length > 0 ? String(peers.length) : 'none'} />
-        <Stat label="Inference speed" value={`${tokPerSec.toFixed(1)} tok/s`} />
+        <Stat label="Loopback rate" value={`${loopbackFps.toFixed(1)} frames/s`} />
       </div>
 
       <div className="mt-4 grid gap-4 lg:grid-cols-[220px_1fr]">

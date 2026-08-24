@@ -77,11 +77,27 @@ interface PipelineApi {
   frameAsFloat32(frame: TensorFrameLike): Float32Array;
 }
 
+/**
+ * Wait for the dev-build `window.p2pPipeline` hook.
+ *
+ * On a cold `npm run dev`, Vite pre-bundles dependencies on the first request
+ * and then forces a full page reload, which destroys the execution context
+ * this poll is running in. That only happens on the very first navigation, so
+ * one reload-and-retry is enough — without it the suite passes against a warm
+ * server locally and fails every time in CI.
+ */
 async function waitForPipelineHook(page: Page): Promise<void> {
-  await page.waitForFunction(() => {
+  const hookPresent = (): boolean => {
     const w = window as unknown as { p2pPipeline?: { PipelineNode?: unknown } };
     return Boolean(w.p2pPipeline?.PipelineNode);
-  });
+  };
+
+  try {
+    await page.waitForFunction(hookPresent, undefined, { timeout: 30_000 });
+  } catch {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(hookPresent, undefined, { timeout: 30_000 });
+  }
 }
 
 // ---------------------------------------------------------------------------

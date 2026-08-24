@@ -27,14 +27,18 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      # 2. In-memory MockTransport tests (Playwright + headless Chromium).
+      # 2. Unit tests: tensor wire format + scheduler invariants (Vitest).
+      - name: Unit tests
+        run: npm test
+
+      # 3. In-memory MockTransport tests (Playwright + headless Chromium).
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Run MockTransport tests
         run: npm run test:e2e:manual
 
-      # 3. Production build verification.
+      # 4. Production build verification.
       - name: Build
         run: npm run build
 

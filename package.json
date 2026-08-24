@@ -2,16 +2,17 @@
   "name": "mesh-gpu-client",
   "version": "0.1.0",
   "private": true,
-  "description": "MeshGPU browser client — WebGPU + WebRTC P2P model inference.",
+  "description": "MeshGPU browser client \u2014 WebGPU capability probing, serverless WebRTC pairing, and a P2P tensor transport.",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json && vite build",
+    "build": "npm run typecheck && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
-    "test": "playwright test tests/e2e-manual-handshake.spec.ts",
-    "test:e2e:manual": "playwright test tests/e2e-manual-handshake.spec.ts",
-    "test:e2e": "playwright test"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:manual": "playwright test tests/e2e-manual-handshake.spec.ts"
   },
   "engines": {
     "node": ">=18"
@@ -37,6 +38,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^2.1.9"
   }
 }

@@ -385,7 +385,7 @@ export class PeerLink {
   private channelsOpen = 0;
   private closed = false;
   private relayForced = false;
-  private fallbackTimer: number | null = null;
+  private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private readonly pendingLatency = new Map<number, (rttMs: number) => void>();
 
@@ -725,7 +725,7 @@ export class PipelineMesh {
   private readonly callbacks: MeshCallbacks;
   private readonly links = new Map<string, PeerLink>();
   private readonly lastSeen = new Map<string, number>();
-  private heartbeatTimer: number | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: PipelineMeshOptions) {
     this.signaling = options.signaling;
